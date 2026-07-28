@@ -36,6 +36,7 @@ import os
 import re
 import sys
 import json
+import time
 import datetime as dt
 from dataclasses import dataclass, field
 
@@ -48,6 +49,15 @@ from google.oauth2.service_account import Credentials
 # ---------------------------------------------------------------------------
 
 SHEET_ID = "10osrvx4zsemAQy3rAci2tbV3cAzRBSM8ocecbnuw76I"
+
+# The workbook has 40+ monthly tabs. Reading each one with get_all_values()
+# in a tight loop reliably hits the Sheets API's per-minute read quota -
+# this caused a real incident where most tabs were silently skipped and
+# only one made it into Supabase. Every read is now retried with backoff
+# on rate-limit errors, and throttled up front to avoid hitting the wall
+# in the first place.
+SHEETS_REQUEST_DELAY_SECONDS = 1.1
+SHEETS_MAX_RETRIES = 5
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -173,6 +183,29 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 
+def get_all_values_with_retry(ws):
+    """Reads a worksheet's values, retrying with backoff on rate-limit
+    errors instead of silently giving up. This is the fix for a real
+    incident where a plain try/except swallowed 429s across ~40 tabs and
+    only one tab's data ever made it into Supabase."""
+    for attempt in range(SHEETS_MAX_RETRIES):
+        try:
+            values = ws.get_all_values()
+            time.sleep(SHEETS_REQUEST_DELAY_SECONDS)
+            return values
+        except gspread.exceptions.APIError as e:
+            status = getattr(e.response, "status_code", None)
+            is_rate_limit = status == 429 or (
+                e.response is not None and "RESOURCE_EXHAUSTED" in e.response.text
+            )
+            if not is_rate_limit:
+                raise
+            wait = (2 ** attempt) * 2
+            print(f"Sheets API rate limited reading '{ws.title}', waiting {wait}s (attempt {attempt + 1}/{SHEETS_MAX_RETRIES})")
+            time.sleep(wait)
+    raise RuntimeError(f"Still rate limited reading '{ws.title}' after {SHEETS_MAX_RETRIES} retries")
+
+
 def relevant_worksheets(spreadsheet, cutoff_month_key):
     """Returns worksheets worth scanning: anything whose title looks like a
     month/year tab, without assuming an exact naming scheme (tab-naming has
@@ -190,8 +223,9 @@ def extract_month_aggregates(spreadsheet, months_wanted):
 
     for ws in spreadsheet.worksheets():
         try:
-            values = ws.get_all_values()
-        except gspread.exceptions.APIError:
+            values = get_all_values_with_retry(ws)
+        except Exception as e:
+            print(f"SKIPPING worksheet '{ws.title}' after retries failed: {e}")
             continue
         if not values:
             continue
