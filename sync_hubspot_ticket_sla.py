@@ -25,6 +25,7 @@ recomputed daily, past months written once and left alone.
 """
 
 import os
+import time
 import datetime as dt
 
 import requests
@@ -35,6 +36,12 @@ import requests
 
 HUBSPOT_TOKEN = os.environ["HUBSPOT_PRIVATE_APP_TOKEN"]
 HUBSPOT_SEARCH_URL = "https://api.hubapi.com/crm/v3/objects/tickets/search"
+
+# This script fires 2 requests per owner per month (closed count + within-SLA
+# count) across a 24-month backfill, which adds up fast - throttled and
+# retried on 429s so a burst of rate limiting doesn't kill the whole run.
+REQUEST_DELAY_SECONDS = 0.3
+MAX_RETRIES = 5
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -78,9 +85,17 @@ def hubspot_search_total(filters):
         "properties": ["hs_object_id"],
         "limit": 1,
     }
-    resp = requests.post(HUBSPOT_SEARCH_URL, headers=hubspot_headers(), json=body, timeout=30)
-    resp.raise_for_status()
-    return resp.json()["total"]
+    for attempt in range(MAX_RETRIES):
+        resp = requests.post(HUBSPOT_SEARCH_URL, headers=hubspot_headers(), json=body, timeout=30)
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", 2 ** attempt))
+            print(f"Rate limited, waiting {retry_after}s (attempt {attempt + 1}/{MAX_RETRIES})")
+            time.sleep(retry_after)
+            continue
+        resp.raise_for_status()
+        time.sleep(REQUEST_DELAY_SECONDS)
+        return resp.json()["total"]
+    raise RuntimeError("HubSpot search still rate limited after max retries")
 
 
 def month_bounds(month_key):
