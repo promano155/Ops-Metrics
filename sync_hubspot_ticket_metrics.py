@@ -31,6 +31,7 @@ STAGE_LABELS rather than the query logic.
 """
 
 import os
+import time
 import datetime as dt
 
 import requests
@@ -41,6 +42,13 @@ import requests
 
 HUBSPOT_TOKEN = os.environ["HUBSPOT_PRIVATE_APP_TOKEN"]
 HUBSPOT_SEARCH_URL = "https://api.hubapi.com/crm/v3/objects/tickets/search"
+
+# Private apps are rate limited to a small burst per 10-second window.
+# A 24-month backfill fires enough requests to hit that ceiling, so every
+# call is throttled and 429s are retried with backoff rather than failing
+# the whole run.
+REQUEST_DELAY_SECONDS = 0.3
+MAX_RETRIES = 5
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -74,15 +82,25 @@ def hubspot_headers():
 
 def hubspot_search_total(filter_groups):
     """Returns just the total count matching the filters (limit=1 -> we
-    don't need the records themselves, just the count HubSpot reports)."""
+    don't need the records themselves, just the count HubSpot reports).
+    Throttled and retried on 429s since a full backfill run fires enough
+    requests to hit the private app's short-window rate limit."""
     body = {
         "filterGroups": filter_groups,
         "properties": ["hs_object_id"],
         "limit": 1,
     }
-    resp = requests.post(HUBSPOT_SEARCH_URL, headers=hubspot_headers(), json=body, timeout=30)
-    resp.raise_for_status()
-    return resp.json()["total"]
+    for attempt in range(MAX_RETRIES):
+        resp = requests.post(HUBSPOT_SEARCH_URL, headers=hubspot_headers(), json=body, timeout=30)
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", 2 ** attempt))
+            print(f"Rate limited, waiting {retry_after}s (attempt {attempt + 1}/{MAX_RETRIES})")
+            time.sleep(retry_after)
+            continue
+        resp.raise_for_status()
+        time.sleep(REQUEST_DELAY_SECONDS)
+        return resp.json()["total"]
+    raise RuntimeError("HubSpot search still rate limited after max retries")
 
 
 def month_bounds(month_key):
