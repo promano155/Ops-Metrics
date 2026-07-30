@@ -205,6 +205,14 @@ def get_rows_with_colors(service, sheet_title, hotel_col_index, num_rows, max_co
     drift apart, unlike fetching them via two separate API calls at two
     different moments (a real risk on a sheet people are actively editing).
 
+    Uses effectiveFormat rather than userEnteredFormat for color: the
+    latter only reflects a MANUAL fill and misses any color applied via a
+    conditional formatting rule (e.g. "highlight yellow when Data
+    Priority = Yes") - effectiveFormat reflects what's actually rendered
+    on screen regardless of which mechanism produced it. For a plain
+    manual fill with no competing rule, the two are identical, so this
+    is a strict improvement with no risk to already-calibrated colors.
+
     Returns a list of (row_values, color) tuples, where row_values is a
     list of that row's cell text (same shape as get_all_values() would
     give you) and color is the hotel-name column's background color."""
@@ -214,7 +222,7 @@ def get_rows_with_colors(service, sheet_title, hotel_col_index, num_rows, max_co
         service,
         spreadsheetId=SHEET_ID,
         ranges=[range_str],
-        fields="sheets(data(rowData(values(userEnteredFormat.backgroundColor,formattedValue))))",
+        fields="sheets(data(rowData(values(effectiveFormat.backgroundColor,formattedValue))))",
     )
     row_data = result["sheets"][0]["data"][0].get("rowData", [])
     output = []
@@ -222,7 +230,7 @@ def get_rows_with_colors(service, sheet_title, hotel_col_index, num_rows, max_co
         cells = row_entry.get("values", [])
         row_values = [c.get("formattedValue", "") for c in cells]
         hotel_cell = cells[hotel_col_index] if len(cells) > hotel_col_index else {}
-        bg = hotel_cell.get("userEnteredFormat", {}).get("backgroundColor", {})
+        bg = hotel_cell.get("effectiveFormat", {}).get("backgroundColor", {})
         color = (bg.get("red", 1.0), bg.get("green", 1.0), bg.get("blue", 1.0))
         output.append((row_values, color))
     return output
