@@ -30,10 +30,10 @@ The actual due date value is NEVER written into any Asana-visible field
 routing and logged to Supabase. All the third party sees is which
 section/batch a hotel's subtask lands in.
 
---- Run --list-colors first ---
-I can't verify this sheet's actual RGB values from here. Run
-`python sync_yellow_rows_to_asana.py --list-colors` first, tell me the
-output, and I'll hardcode YELLOW_RGB / GREEN_RGB precisely.
+--- Color calibration: DONE ---
+YELLOW_RGB and GREEN_RGB below are calibrated against the real sheet
+(via --list-colors on 2026-07-30). If the sheet's highlight colors ever
+change, re-run --list-colors and update the constants.
 
 --- Confirmed decisions (see chat) ---
 - "Due today" counts as overdue -> routes to Priority (Within 24hrs).
@@ -82,9 +82,11 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 DEDUP_TABLE = "yellow_row_asana_tasks"
 BATCH_TABLE = "asana_batch_sections"
 
-# PLACEHOLDER VALUES - calibrate with --list-colors before trusting this.
-YELLOW_RGB = (1.0, 0.949, 0.8)
-GREEN_RGB = (0.851, 0.918, 0.827)
+# Calibrated against the real sheet via --list-colors on 2026-07-30.
+# Yellow is technically Google Sheets' "light orange 3" swatch, not
+# "light yellow 3" - reads as pale yellow/cream to the eye either way.
+YELLOW_RGB = (0.988, 0.898, 0.804)
+GREEN_RGB = (0.714, 0.843, 0.659)
 COLOR_TOLERANCE = 0.03
 
 COLUMN_ALIASES = {
