@@ -68,6 +68,9 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 TRAILING_MONTHS = 24  # how far back to backfill/consider for the trend line
 BUSINESS_DAY_SLA = 7
+MONTH_OFFSET = 1  # the actively-worked tab is always the PREVIOUS calendar
+                  # month, not the current one - confirmed with the team.
+                  # e.g. in late July, the live/active tab is still June's.
 
 # Column name aliases. Matching is case-insensitive and ignores surrounding
 # whitespace. Add new observed variants here as the sheet evolves.
@@ -326,7 +329,7 @@ def upsert_month(month_key, agg, status):
 
 def month_key_n_back(n):
     today = dt.date.today()
-    month = today.month - n
+    month = today.month - (n + MONTH_OFFSET)
     year = today.year
     while month <= 0:
         month += 12
