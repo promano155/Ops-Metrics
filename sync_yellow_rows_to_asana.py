@@ -441,6 +441,20 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
     max_col_index = max(col_hotel, col_due if col_due is not None else 0, col_period)
     pairs = get_rows_with_colors(service, sheet_title, col_hotel, len(all_rows_for_count), max_col_index)
 
+    # ONE-OFF DIAGNOSTIC: check whether Priority Due Date has merged cells,
+    # which would explain visible text reading as empty via the API (the
+    # value lives only in the merge's anchor cell, not every row it spans).
+    if col_due is not None:
+        merge_check = sheets_get_with_retry(
+            service, spreadsheetId=SHEET_ID, ranges=[f"'{sheet_title}'"], fields="sheets(merges)"
+        )
+        merges = merge_check["sheets"][0].get("merges", [])
+        due_col_merges = [
+            m for m in merges
+            if m.get("startColumnIndex", -1) <= col_due < m.get("endColumnIndex", -1)
+        ]
+        print(f"Merged ranges overlapping Priority Due Date column: {due_col_merges}")
+
     if list_colors_only:
         seen = {}
         for row, color in pairs:
