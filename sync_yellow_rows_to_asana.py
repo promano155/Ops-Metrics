@@ -196,9 +196,17 @@ def rgb_close(c1, c2, tolerance=COLOR_TOLERANCE):
     return all(abs(a - b) <= tolerance for a, b in zip(c1, c2))
 
 
-def get_row_colors(service, sheet_title, hotel_col_index, num_rows):
-    col_letter = chr(ord("A") + hotel_col_index)
-    range_str = f"'{sheet_title}'!{col_letter}2:{col_letter}{num_rows + 1}"
+def get_rows_with_colors(service, sheet_title, hotel_col_index, num_rows, max_col_index):
+    """Fetches BOTH cell text and background color in ONE request, for the
+    same snapshot - this guarantees a row's text and its color can never
+    drift apart, unlike fetching them via two separate API calls at two
+    different moments (a real risk on a sheet people are actively editing).
+
+    Returns a list of (row_values, color) tuples, where row_values is a
+    list of that row's cell text (same shape as get_all_values() would
+    give you) and color is the hotel-name column's background color."""
+    end_col_letter = chr(ord("A") + max_col_index)
+    range_str = f"'{sheet_title}'!A2:{end_col_letter}{num_rows + 1}"
     result = sheets_get_with_retry(
         service,
         spreadsheetId=SHEET_ID,
@@ -206,13 +214,15 @@ def get_row_colors(service, sheet_title, hotel_col_index, num_rows):
         fields="sheets(data(rowData(values(userEnteredFormat.backgroundColor,formattedValue))))",
     )
     row_data = result["sheets"][0]["data"][0].get("rowData", [])
-    colors = []
-    for row in row_data:
-        cell = (row.get("values") or [{}])[0]
-        bg = cell.get("userEnteredFormat", {}).get("backgroundColor", {})
-        rgb = (bg.get("red", 1.0), bg.get("green", 1.0), bg.get("blue", 1.0))
-        colors.append(rgb)
-    return colors
+    output = []
+    for row_entry in row_data:
+        cells = row_entry.get("values", [])
+        row_values = [c.get("formattedValue", "") for c in cells]
+        hotel_cell = cells[hotel_col_index] if len(cells) > hotel_col_index else {}
+        bg = hotel_cell.get("userEnteredFormat", {}).get("backgroundColor", {})
+        color = (bg.get("red", 1.0), bg.get("green", 1.0), bg.get("blue", 1.0))
+        output.append((row_values, color))
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -416,9 +426,8 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
         return
 
     sheet_title, headers, col_period, col_hotel, col_due = found
-    values = values_by_title[sheet_title]
-    data_rows = values[1:]
-    print(f"Using worksheet '{sheet_title}' for {target_month}, {len(data_rows)} rows.")
+    all_rows_for_count = values_by_title[sheet_title][1:]
+    print(f"Using worksheet '{sheet_title}' for {target_month}, {len(all_rows_for_count)} rows.")
     if col_due is None:
         print("WARNING: 'Priority Due Date' column was NOT found on this worksheet - "
               "every row will show due_day_group='blank' regardless of actual due dates. "
@@ -426,11 +435,15 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
     else:
         print(f"Priority Due Date column found: '{headers[col_due]}' (index {col_due})")
 
-    colors = get_row_colors(service, sheet_title, col_hotel, len(data_rows))
+    # Single combined fetch, same snapshot for text AND color - see
+    # get_rows_with_colors docstring for why this replaced two separate
+    # calls (drift risk on a sheet people are actively editing).
+    max_col_index = max(col_hotel, col_due if col_due is not None else 0, col_period)
+    pairs = get_rows_with_colors(service, sheet_title, col_hotel, len(all_rows_for_count), max_col_index)
 
     if list_colors_only:
         seen = {}
-        for row, color in zip(data_rows, colors):
+        for row, color in pairs:
             seen[color] = seen.get(color, 0) + 1
         print("\nDistinct background colors found in the Hotel Name column:")
         for color, count in sorted(seen.items(), key=lambda x: -x[1]):
@@ -450,7 +463,7 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
     # and group them by due_day_group so each group can be placed as one
     # atomic cohort - never split across the 25-cap.
     groups = {}  # due_day_group -> list of hotel_name
-    for row, color in zip(data_rows, colors):
+    for row, color in pairs:
         if len(row) <= max(col_period, col_hotel):
             continue
         hotel_name = row[col_hotel].strip()
