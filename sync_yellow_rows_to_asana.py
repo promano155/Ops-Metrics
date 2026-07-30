@@ -81,6 +81,7 @@ SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 DEDUP_TABLE = "yellow_row_asana_tasks"
 BATCH_TABLE = "asana_batch_sections"
+STANDARD_BATCH_SEQUENCE_TABLE = "standard_sla_batch_sequence"
 
 # Calibrated against the real sheet via --list-colors on 2026-07-30.
 # Yellow is technically Google Sheets' "light orange 3" swatch, not
@@ -93,6 +94,7 @@ COLUMN_ALIASES = {
     "billing_period": ["Billing Period Analyzed", "Period Being Analyzed"],
     "hotel_name": ["Hotel Name", "Hotel"],
     "priority_due_date": ["Priority Due Date"],
+    "data_priority": ["Data Priority"],
 }
 
 # ---------------------------------------------------------------------------
@@ -182,13 +184,14 @@ def find_current_month_worksheet(values_by_title, target_month_key):
         col_period = find_col_index(headers, "billing_period")
         col_hotel = find_col_index(headers, "hotel_name")
         col_due = find_col_index(headers, "priority_due_date")
+        col_data_priority = find_col_index(headers, "data_priority")
         if col_period is None or col_hotel is None:
             continue
         for row in values[1:]:
             if len(row) <= col_period:
                 continue
             if parse_billing_period(row[col_period]) == target_month_key:
-                return title, headers, col_period, col_hotel, col_due
+                return title, headers, col_period, col_hotel, col_due, col_data_priority
     return None
 
 
@@ -262,7 +265,7 @@ def find_section_gid(sections, name):
     )
 
 
-def create_batch_task(name, section_gid):
+def create_batch_task(name, section_gid, due_at=None):
     """Creates the parent 'batch' task and places it in the given section."""
     payload = {
         "data": {
@@ -271,6 +274,8 @@ def create_batch_task(name, section_gid):
             "memberships": [{"project": ASANA_PROJECT_GID, "section": section_gid}],
         }
     }
+    if due_at:
+        payload["data"]["due_at"] = due_at
     data = asana_request("POST", "/tasks", json=payload)
     return data["gid"]
 
@@ -285,6 +290,24 @@ def create_hotel_subtask(hotel_name, month_key, parent_task_gid):
         }
     }
     data = asana_request("POST", f"/tasks/{parent_task_gid}/subtasks", json=payload)
+    return data["gid"]
+
+
+def create_standalone_priority_task(hotel_name, month_key, section_gid):
+    """For Data Priority = Yes rows: a real top-level task added directly
+    to the project/section, NOT a subtask - deliberately not nested, so
+    each one is its own 'task added to project' event (triggers a channel
+    ping per overdue-priority hotel, and reliably catches project-scoped
+    rules like DRI auto-assignment, unlike subtasks)."""
+    payload = {
+        "data": {
+            "name": f"Follow up: {hotel_name}",
+            "notes": f"Flagged yellow (Data Priority) on the Curacity Billing Overview sheet for {month_key}.",
+            "projects": [ASANA_PROJECT_GID],
+            "memberships": [{"project": ASANA_PROJECT_GID, "section": section_gid}],
+        }
+    }
+    data = asana_request("POST", "/tasks", json=payload)
     return data["gid"]
 
 
@@ -356,7 +379,47 @@ def upsert_batch_state(month_key, due_day_group, batch_number, batch_task_gid, t
     resp.raise_for_status()
 
 
-def get_or_create_batch_task_for_group(month_key, due_day_group, month_name, section_gid, count_needed):
+def get_next_standard_batch_due_at(month_key, dry_run=False):
+    """48hr SLA batches ONLY (never Priority - that has its own native-
+    rule SLA already). Global per month, NOT per due-day-group: the
+    first 48hr-SLA batch created this month gets now + 48h; every batch
+    created after that gets the PREVIOUS batch's due date + 24h, chained
+    in creation order regardless of which due-day-group triggered it.
+
+    In dry_run mode this only reads existing state and never writes -
+    safe to call repeatedly without advancing the real sequence."""
+    url = f"{SUPABASE_URL}/rest/v1/{STANDARD_BATCH_SEQUENCE_TABLE}?month_key=eq.{month_key}"
+    resp = requests.get(url, headers=supabase_headers(), timeout=30)
+    resp.raise_for_status()
+    rows = resp.json()
+
+    if rows:
+        last_due_at = dt.datetime.fromisoformat(rows[0]["last_due_at"].replace("Z", ""))
+        next_due_at = last_due_at + dt.timedelta(hours=24)
+        next_sequence = rows[0]["sequence_number"] + 1
+    else:
+        next_due_at = dt.datetime.utcnow() + dt.timedelta(hours=48)
+        next_sequence = 1
+
+    if not dry_run:
+        payload = {
+            "month_key": month_key,
+            "sequence_number": next_sequence,
+            "last_due_at": next_due_at.isoformat(),
+        }
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/{STANDARD_BATCH_SEQUENCE_TABLE}",
+            headers={**supabase_headers(), "Prefer": "resolution=merge-duplicates"},
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+    return next_due_at.isoformat() + "Z", next_sequence
+
+
+def get_or_create_batch_task_for_group(month_key, due_day_group, month_name, section_gid, count_needed,
+                                        apply_staggered_due_date=False):
     """Places an entire same-due-date cohort (count_needed new subtasks
     from this run) into one batch task - never split across two.
 
@@ -364,7 +427,13 @@ def get_or_create_batch_task_for_group(month_key, due_day_group, month_name, sec
     count_needed, they all go there. If not, a brand new batch task is
     created for the WHOLE cohort, even if that leaves the previous batch
     permanently short of 25. This is intentional: a due date is never
-    allowed to straddle two batches, even partially."""
+    allowed to straddle two batches, even partially.
+
+    apply_staggered_due_date=True ONLY for 48hr SLA batches (never
+    Priority, which has its own native-rule SLA) - see
+    get_next_standard_batch_due_at for the 48h-then-chained-24h logic.
+    Reusing an existing batch never touches its due date - only set once,
+    at creation."""
     state = get_batch_state(month_key, due_day_group)
     remaining = (BATCH_SIZE - state["task_count"]) if state else 0
 
@@ -375,7 +444,13 @@ def get_or_create_batch_task_for_group(month_key, due_day_group, month_name, sec
 
     next_batch_number = (state["batch_number"] + 1) if state else 1
     batch_name = f"{month_name} Batch {next_batch_number}"
-    batch_task_gid = create_batch_task(batch_name, section_gid)
+
+    due_at = None
+    if apply_staggered_due_date:
+        due_at, sequence_number = get_next_standard_batch_due_at(month_key)
+        print(f"Staggered due date for '{batch_name}': {due_at} (sequence #{sequence_number})")
+
+    batch_task_gid = create_batch_task(batch_name, section_gid, due_at=due_at)
     upsert_batch_state(month_key, due_day_group, next_batch_number, batch_task_gid, count_needed)
     print(f"Created new batch task '{batch_name}' for due-day group '{due_day_group}' ({count_needed} rows)")
     return batch_task_gid
@@ -425,35 +500,26 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
         print(f"No worksheet found with rows matching {target_month}.")
         return
 
-    sheet_title, headers, col_period, col_hotel, col_due = found
+    sheet_title, headers, col_period, col_hotel, col_due, col_data_priority = found
     all_rows_for_count = values_by_title[sheet_title][1:]
     print(f"Using worksheet '{sheet_title}' for {target_month}, {len(all_rows_for_count)} rows.")
     if col_due is None:
         print("WARNING: 'Priority Due Date' column was NOT found on this worksheet - "
               "every row will show due_day_group='blank' regardless of actual due dates. "
               f"Headers found: {headers}")
-    else:
-        print(f"Priority Due Date column found: '{headers[col_due]}' (index {col_due})")
+    if col_data_priority is None:
+        print("WARNING: 'Data Priority' column was NOT found on this worksheet - "
+              "no rows will be routed as standalone priority tasks.")
 
     # Single combined fetch, same snapshot for text AND color - see
     # get_rows_with_colors docstring for why this replaced two separate
     # calls (drift risk on a sheet people are actively editing).
-    max_col_index = max(col_hotel, col_due if col_due is not None else 0, col_period)
+    max_col_index = max(
+        col_hotel, col_period,
+        col_due if col_due is not None else 0,
+        col_data_priority if col_data_priority is not None else 0,
+    )
     pairs = get_rows_with_colors(service, sheet_title, col_hotel, len(all_rows_for_count), max_col_index)
-
-    # ONE-OFF DIAGNOSTIC: check whether Priority Due Date has merged cells,
-    # which would explain visible text reading as empty via the API (the
-    # value lives only in the merge's anchor cell, not every row it spans).
-    if col_due is not None:
-        merge_check = sheets_get_with_retry(
-            service, spreadsheetId=SHEET_ID, ranges=[f"'{sheet_title}'"], fields="sheets(merges)"
-        )
-        merges = merge_check["sheets"][0].get("merges", [])
-        due_col_merges = [
-            m for m in merges
-            if m.get("startColumnIndex", -1) <= col_due < m.get("endColumnIndex", -1)
-        ]
-        print(f"Merged ranges overlapping Priority Due Date column: {due_col_merges}")
 
     if list_colors_only:
         seen = {}
@@ -473,9 +539,14 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
         priority_section_gid = "DRY_RUN_PRIORITY_SECTION"
         standard_section_gid = "DRY_RUN_STANDARD_SECTION"
 
-    # Pass 1: figure out which rows are new (yellow, not yet actioned),
-    # and group them by due_day_group so each group can be placed as one
-    # atomic cohort - never split across the 25-cap.
+    # Pass 1: figure out which rows are new (yellow, not yet actioned).
+    # Split into two paths:
+    #  - Data Priority = Yes -> standalone task, straight to Priority,
+    #    never nested/batched (confirmed decision - these ping the
+    #    channel individually and reliably hit project-scoped rules).
+    #  - everything else -> grouped by due_day_group for nested batching,
+    #    exactly as originally designed.
+    priority_flag_hotels = []
     groups = {}  # due_day_group -> list of hotel_name
     for row, color in pairs:
         if len(row) <= max(col_period, col_hotel):
@@ -493,10 +564,15 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
         if already_actioned(dedup_key):  # read-only either way, safe in dry-run
             continue
 
+        data_priority_value = (
+            row[col_data_priority].strip() if (col_data_priority is not None and len(row) > col_data_priority) else ""
+        )
+        if data_priority_value.lower() == "yes":
+            priority_flag_hotels.append(hotel_name)
+            continue
+
         due_value = row[col_due].strip() if (col_due is not None and len(row) > col_due) else ""
         due_day = parse_due_day(due_value)
-        print(f"DEBUG '{hotel_name}': due_value={due_value!r}, row length={len(row)}, "
-              f"raw cols 6-10={row[6:11] if len(row) > 6 else row}")
 
         if due_day is not None and due_day <= today_day:
             due_day_group = "overdue"
@@ -505,15 +581,27 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
 
         groups.setdefault(due_day_group, []).append(hotel_name)
 
-    if not groups:
+    if not priority_flag_hotels and not groups:
         print("No new yellow rows to action.")
         return
 
-    # Pass 2: place each group's entire cohort into one batch task
-    # (or simulate doing so, in dry-run mode).
+    # Pass 2a: Data Priority = Yes hotels - standalone tasks, straight
+    # into Priority, one "task added to project" event each.
+    for hotel_name in priority_flag_hotels:
+        if dry_run:
+            print(f"[DRY RUN] Data Priority=Yes -> standalone task in 'Priority (Within 24hrs)' for '{hotel_name}'")
+            continue
+        dedup_key = f"{target_month}:{hotel_name}"
+        task_gid = create_standalone_priority_task(hotel_name, target_month, priority_section_gid)
+        record_actioned(dedup_key, target_month, hotel_name, task_gid, due_day_group="data_priority_flag")
+        print(f"Data Priority=Yes -> standalone task {task_gid} for '{hotel_name}'")
+
+    # Pass 2b: everything else - place each group's entire cohort into
+    # one nested batch task (or simulate doing so, in dry-run mode).
     for due_day_group, hotel_names in groups.items():
         section_label = "Priority (Within 24hrs)" if due_day_group == "overdue" else "48 hr SLA"
         target_section_gid = priority_section_gid if due_day_group == "overdue" else standard_section_gid
+        apply_staggered_due_date = (due_day_group != "overdue")  # never for Priority
 
         if dry_run:
             state = get_batch_state(target_month, due_day_group)  # read-only, safe
@@ -522,16 +610,23 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
             if state and remaining >= count_needed:
                 batch_label = f"{month_name} Batch {state['batch_number']}"
                 action = f"REUSE existing batch (currently {state['task_count']}/{BATCH_SIZE}, room for {remaining})"
+                due_note = "(due date unchanged - only set at creation)"
             else:
                 next_num = (state["batch_number"] + 1) if state else 1
                 batch_label = f"{month_name} Batch {next_num}"
                 action = "CREATE NEW batch" if state else "CREATE FIRST batch"
+                if apply_staggered_due_date:
+                    projected_due_at, seq = get_next_standard_batch_due_at(target_month, dry_run=True)
+                    due_note = f"(would set due_at={projected_due_at}, sequence #{seq})"
+                else:
+                    due_note = "(no due date - Priority has its own native-rule SLA)"
             print(f"[DRY RUN] Group '{due_day_group}' -> section '{section_label}', {action}: "
-                  f"'{batch_label}', would add {count_needed} subtask(s): {hotel_names}")
+                  f"'{batch_label}' {due_note}, would add {count_needed} subtask(s): {hotel_names}")
             continue
 
         batch_task_gid = get_or_create_batch_task_for_group(
-            target_month, due_day_group, month_name, target_section_gid, len(hotel_names)
+            target_month, due_day_group, month_name, target_section_gid, len(hotel_names),
+            apply_staggered_due_date=apply_staggered_due_date,
         )
         for hotel_name in hotel_names:
             dedup_key = f"{target_month}:{hotel_name}"
