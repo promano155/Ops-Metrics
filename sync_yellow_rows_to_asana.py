@@ -419,6 +419,12 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
     values = values_by_title[sheet_title]
     data_rows = values[1:]
     print(f"Using worksheet '{sheet_title}' for {target_month}, {len(data_rows)} rows.")
+    if col_due is None:
+        print("WARNING: 'Priority Due Date' column was NOT found on this worksheet - "
+              "every row will show due_day_group='blank' regardless of actual due dates. "
+              f"Headers found: {headers}")
+    else:
+        print(f"Priority Due Date column found: '{headers[col_due]}' (index {col_due})")
 
     colors = get_row_colors(service, sheet_title, col_hotel, len(data_rows))
 
