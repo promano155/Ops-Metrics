@@ -468,6 +468,8 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
 
         due_value = row[col_due].strip() if (col_due is not None and len(row) > col_due) else ""
         due_day = parse_due_day(due_value)
+        print(f"DEBUG '{hotel_name}': due_value={due_value!r}, row length={len(row)}, "
+              f"raw cols 6-10={row[6:11] if len(row) > 6 else row}")
 
         if due_day is not None and due_day <= today_day:
             due_day_group = "overdue"
