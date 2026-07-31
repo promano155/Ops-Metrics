@@ -1,7 +1,10 @@
+# Move this file to .github/workflows/data-processing-sync.yml in your repo.
 name: Sync data processing metrics
 
 on:
   schedule:
+    # 13:00 UTC daily (adjust for your team's morning). GitHub Actions cron
+    # can run a few minutes late, which is fine for a daily rollup.
     - cron: "0 13 * * *"
   workflow_dispatch:
     inputs:
@@ -21,7 +24,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install gspread google-auth google-api-python-client requests
+        run: pip install gspread google-auth requests
 
       - name: Run data processing sync
         env:
