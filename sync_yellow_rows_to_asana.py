@@ -2,9 +2,9 @@
 sync_yellow_rows_to_asana.py
 
 Scans the CURRENT month's billing tab only (not historical tabs) for
-manually color-highlighted rows. Green rows = no action. Yellow rows
-become a subtask of the appropriate batch, which lives inside one of two
-existing sections:
+rows checked in the "Flag to Innova" column. Unchecked/blank = no
+action. Checked rows become a subtask of the appropriate batch, which
+lives inside one of two existing sections:
 
 - "Priority (Within 24hrs)" - due today or already passed.
 - "48 hr SLA"                - everything else, regardless of how far out.
@@ -30,17 +30,24 @@ The actual due date value is NEVER written into any Asana-visible field
 routing and logged to Supabase. All the third party sees is which
 section/batch a hotel's subtask lands in.
 
---- Color calibration: DONE ---
-YELLOW_RGB and GREEN_RGB below are calibrated against the real sheet
-(via --list-colors on 2026-07-30). If the sheet's highlight colors ever
-change, re-run --list-colors and update the constants.
+--- Why a checkbox instead of cell color ---
+This used to detect flagged rows by background color (yellow vs green).
+That was abandoned after two separate, never-fully-resolved mysteries:
+a due-date column reading as empty despite visibly showing text, and a
+"Flag to Innova" candidate row (Amanpuri) reading as an unrecognized
+color despite being visibly yellow across the whole row, with values
+that didn't match calibration against any tab on the sheet. A checkbox
+reads as a plain TRUE/FALSE via the API - no RGB tolerance, no
+effectiveFormat-vs-userEnteredFormat ambiguity, no color-matching at
+all. The sheet can still be colored for humans scanning it visually;
+the script no longer looks at color at all.
 
 --- Confirmed decisions (see chat) ---
 - "Due today" counts as overdue -> routes to Priority (Within 24hrs).
 - Everything else -> "48 hr SLA", regardless of how far away the due
   date is. No third tier.
-- This script does not set any due date or SLA field - existing Asana
-  rules on those sections handle the SLA.
+- This script does not set any due date or SLA field on Priority tasks
+  - an existing Asana rule on that section handles the SLA.
 - Note for later: if you ever want to programmatically check subtask
   completion status for reporting, Asana's nested subtask fields are
   unreliable via include_subtasks - each subtask needs its own get_task
@@ -48,10 +55,8 @@ change, re-run --list-colors and update the constants.
   it as a known constraint if this gets extended.
 """
 
-import argparse
 import os
 import re
-import sys
 import json
 import time
 import calendar
@@ -59,7 +64,6 @@ import datetime as dt
 
 import requests
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
 
 # ---------------------------------------------------------------------------
 # Config
@@ -83,18 +87,14 @@ DEDUP_TABLE = "yellow_row_asana_tasks"
 BATCH_TABLE = "asana_batch_sections"
 STANDARD_BATCH_SEQUENCE_TABLE = "standard_sla_batch_sequence"
 
-# Calibrated against the real sheet via --list-colors on 2026-07-30.
-# Yellow is technically Google Sheets' "light orange 3" swatch, not
-# "light yellow 3" - reads as pale yellow/cream to the eye either way.
-YELLOW_RGB = (0.988, 0.898, 0.804)
-GREEN_RGB = (0.714, 0.843, 0.659)
-COLOR_TOLERANCE = 0.03
+TRUE_VALUES = {"true", "yes", "y", "1", "checked"}
 
 COLUMN_ALIASES = {
     "billing_period": ["Billing Period Analyzed", "Period Being Analyzed"],
     "hotel_name": ["Hotel Name", "Hotel"],
     "priority_due_date": ["Priority Due Date"],
     "data_priority": ["Data Priority"],
+    "flag_to_innova": ["Flag to Innova"],
 }
 
 # ---------------------------------------------------------------------------
@@ -105,20 +105,6 @@ COLUMN_ALIASES = {
 def get_credentials():
     creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     return Credentials.from_service_account_info(creds_dict, scopes=SHEETS_SCOPES)
-
-
-def sheets_get_with_retry(service, **kwargs):
-    for attempt in range(5):
-        try:
-            return service.spreadsheets().get(**kwargs).execute()
-        except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                wait = (2 ** attempt) * 2
-                print(f"Sheets API rate limited, waiting {wait}s (attempt {attempt + 1}/5)")
-                time.sleep(wait)
-                continue
-            raise
-    raise RuntimeError("Still rate limited after 5 retries")
 
 
 def current_month_key():
@@ -185,55 +171,19 @@ def find_current_month_worksheet(values_by_title, target_month_key):
         col_hotel = find_col_index(headers, "hotel_name")
         col_due = find_col_index(headers, "priority_due_date")
         col_data_priority = find_col_index(headers, "data_priority")
+        col_flag = find_col_index(headers, "flag_to_innova")
         if col_period is None or col_hotel is None:
             continue
         for row in values[1:]:
             if len(row) <= col_period:
                 continue
             if parse_billing_period(row[col_period]) == target_month_key:
-                return title, headers, col_period, col_hotel, col_due, col_data_priority
+                return title, headers, col_period, col_hotel, col_due, col_data_priority, col_flag
     return None
 
 
-def rgb_close(c1, c2, tolerance=COLOR_TOLERANCE):
-    return all(abs(a - b) <= tolerance for a, b in zip(c1, c2))
-
-
-def get_rows_with_colors(service, sheet_title, hotel_col_index, num_rows, max_col_index):
-    """Fetches BOTH cell text and background color in ONE request, for the
-    same snapshot - this guarantees a row's text and its color can never
-    drift apart, unlike fetching them via two separate API calls at two
-    different moments (a real risk on a sheet people are actively editing).
-
-    Uses effectiveFormat rather than userEnteredFormat for color: the
-    latter only reflects a MANUAL fill and misses any color applied via a
-    conditional formatting rule (e.g. "highlight yellow when Data
-    Priority = Yes") - effectiveFormat reflects what's actually rendered
-    on screen regardless of which mechanism produced it. For a plain
-    manual fill with no competing rule, the two are identical, so this
-    is a strict improvement with no risk to already-calibrated colors.
-
-    Returns a list of (row_values, color) tuples, where row_values is a
-    list of that row's cell text (same shape as get_all_values() would
-    give you) and color is the hotel-name column's background color."""
-    end_col_letter = chr(ord("A") + max_col_index)
-    range_str = f"'{sheet_title}'!A2:{end_col_letter}{num_rows + 1}"
-    result = sheets_get_with_retry(
-        service,
-        spreadsheetId=SHEET_ID,
-        ranges=[range_str],
-        fields="sheets(data(rowData(values(effectiveFormat.backgroundColor,formattedValue))))",
-    )
-    row_data = result["sheets"][0]["data"][0].get("rowData", [])
-    output = []
-    for row_entry in row_data:
-        cells = row_entry.get("values", [])
-        row_values = [c.get("formattedValue", "") for c in cells]
-        hotel_cell = cells[hotel_col_index] if len(cells) > hotel_col_index else {}
-        bg = hotel_cell.get("effectiveFormat", {}).get("backgroundColor", {})
-        color = (bg.get("red", 1.0), bg.get("green", 1.0), bg.get("blue", 1.0))
-        output.append((row_values, color))
-    return output
+def is_truthy(value):
+    return (value or "").strip().lower() in TRUE_VALUES
 
 
 # ---------------------------------------------------------------------------
@@ -469,9 +419,8 @@ def get_or_create_batch_task_for_group(month_key, due_day_group, month_name, sec
 # ---------------------------------------------------------------------------
 
 
-def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_override=None):
+def main(dry_run=False, month_override=None, as_of_day_override=None):
     creds = get_credentials()
-    service = build("sheets", "v4", credentials=creds)
 
     import gspread
     gc = gspread.authorize(creds)
@@ -508,9 +457,13 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
         print(f"No worksheet found with rows matching {target_month}.")
         return
 
-    sheet_title, headers, col_period, col_hotel, col_due, col_data_priority = found
-    all_rows_for_count = values_by_title[sheet_title][1:]
-    print(f"Using worksheet '{sheet_title}' for {target_month}, {len(all_rows_for_count)} rows.")
+    sheet_title, headers, col_period, col_hotel, col_due, col_data_priority, col_flag = found
+    data_rows = values_by_title[sheet_title][1:]
+    print(f"Using worksheet '{sheet_title}' for {target_month}, {len(data_rows)} rows.")
+    if col_flag is None:
+        print("WARNING: 'Flag to Innova' column was NOT found on this worksheet - "
+              f"no rows can be actioned. Headers found: {headers}")
+        return
     if col_due is None:
         print("WARNING: 'Priority Due Date' column was NOT found on this worksheet - "
               "every row will show due_day_group='blank' regardless of actual due dates. "
@@ -518,26 +471,6 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
     if col_data_priority is None:
         print("WARNING: 'Data Priority' column was NOT found on this worksheet - "
               "no rows will be routed as standalone priority tasks.")
-
-    # Single combined fetch, same snapshot for text AND color - see
-    # get_rows_with_colors docstring for why this replaced two separate
-    # calls (drift risk on a sheet people are actively editing).
-    max_col_index = max(
-        col_hotel, col_period,
-        col_due if col_due is not None else 0,
-        col_data_priority if col_data_priority is not None else 0,
-    )
-    pairs = get_rows_with_colors(service, sheet_title, col_hotel, len(all_rows_for_count), max_col_index)
-
-    if list_colors_only:
-        seen = {}
-        for row, color in pairs:
-            seen[color] = seen.get(color, 0) + 1
-        print("\nDistinct background colors found in the Hotel Name column:")
-        for color, count in sorted(seen.items(), key=lambda x: -x[1]):
-            print(f"  RGB{tuple(round(c, 3) for c in color)} - {count} row(s)")
-        print("\nNo Asana tasks created (list-colors mode).")
-        return
 
     if not dry_run:
         sections = get_asana_sections()
@@ -547,8 +480,8 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
         priority_section_gid = "DRY_RUN_PRIORITY_SECTION"
         standard_section_gid = "DRY_RUN_STANDARD_SECTION"
 
-    # Pass 1: figure out which rows are new (yellow, not yet actioned).
-    # Split into two paths:
+    # Pass 1: figure out which rows are new (Flag to Innova checked, not
+    # yet actioned). Split into two paths:
     #  - Data Priority = Yes -> standalone task, straight to Priority,
     #    never nested/batched (confirmed decision - these ping the
     #    channel individually and reliably hit project-scoped rules).
@@ -556,17 +489,15 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
     #    exactly as originally designed.
     priority_flag_hotels = []
     groups = {}  # due_day_group -> list of hotel_name
-    for row, color in pairs:
-        if len(row) <= max(col_period, col_hotel):
+    for row in data_rows:
+        if len(row) <= max(col_period, col_hotel, col_flag):
             continue
         hotel_name = row[col_hotel].strip()
         if not hotel_name:
             continue
 
-        if rgb_close(color, GREEN_RGB):
-            continue  # no action, by design
-        if not rgb_close(color, YELLOW_RGB):
-            continue  # not a color we act on
+        if not is_truthy(row[col_flag]):
+            continue  # not flagged - no action, by design
 
         dedup_key = f"{target_month}:{hotel_name}"
         if already_actioned(dedup_key):  # read-only either way, safe in dry-run
@@ -590,7 +521,7 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
         groups.setdefault(due_day_group, []).append(hotel_name)
 
     if not priority_flag_hotels and not groups:
-        print("No new yellow rows to action.")
+        print("No new flagged rows to action.")
         return
 
     # Pass 2a: Data Priority = Yes hotels - standalone tasks, straight
@@ -644,8 +575,8 @@ def main(list_colors_only=False, dry_run=False, month_override=None, as_of_day_o
 
 
 if __name__ == "__main__":
+    import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--list-colors", action="store_true")
     parser.add_argument("--dry-run", action="store_true",
                          help="No Asana calls or Supabase writes - just prints what would happen.")
     parser.add_argument("--month", type=str, default=None,
@@ -655,7 +586,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(
-        list_colors_only=args.list_colors,
         dry_run=args.dry_run,
         month_override=args.month,
         as_of_day_override=args.as_of_day,
