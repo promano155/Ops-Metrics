@@ -10,6 +10,17 @@ lives inside one of two existing sections:
 - "48 hr SLA"                - everything else, regardless of how far out.
   (There is no third, lower-urgency destination - confirmed.)
 
+--- How "current month" is determined ---
+NOT a fixed calendar formula. This scans every tab, finds every Billing
+Period Analyzed value that actually exists, and targets whichever month
+is MOST RECENT. This replaced an earlier "today's month minus one"
+assumption that broke the first time the team got ahead of the calendar
+and started working next month's tab before the calendar actually
+rolled over - a fixed offset can't account for a team running ahead or
+behind schedule, but reading the sheet's own content always can.
+--month overrides this entirely, for testing against a specific past
+month regardless of what's most recent.
+
 Structure inside each section: batches are PARENT TASKS named
 "{Month} Batch {N}" (e.g. "July Batch 1"), grouped by Priority Due Date
 first (rows due the same day-of-month stay together; overdue rows all
@@ -78,8 +89,6 @@ ASANA_PROJECT_GID = "1207448572741662"  # Data Processing Requests
 PRIORITY_SECTION_NAME = "Priority (Within 24hrs)"  # due today/overdue
 STANDARD_SECTION_NAME = "48 hr SLA"                # everything else
 BATCH_SIZE = 25
-MONTH_OFFSET = 1  # the actively-worked tab is always the PREVIOUS calendar
-                  # month, not the current one - confirmed with the team.
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -107,31 +116,25 @@ def get_credentials():
     return Credentials.from_service_account_info(creds_dict, scopes=SHEETS_SCOPES)
 
 
-def current_month_key():
-    """Returns the ACTIVE tab's month, which is always the previous
-    calendar month, not today's - e.g. in late July this returns
-    '2026-06'. --month overrides this entirely when testing."""
-    today = dt.date.today()
-    month = today.month - MONTH_OFFSET
-    year = today.year
-    if month <= 0:
-        month += 12
-        year -= 1
-    return f"{year:04d}-{month:02d}"
-
-
 def month_name_for(month_key):
     year, month = (int(x) for x in month_key.split("-"))
     return calendar.month_name[month]
 
 
 def parse_billing_period(value):
+    """Returns the month from the SECOND date in the cell (the end of a
+    '{start} - {end}' range), always - not whichever date is
+    chronologically later, and not the first. Billing periods are always
+    written start-then-end by convention, so this is positional, not a
+    comparison: even a malformed row where end < start should still be
+    read by its end date, not whichever number happens to be bigger.
+    Falls back to the only date present if there's just one."""
     if not value:
         return None
-    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", value)
-    if not m:
+    matches = re.findall(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", value)
+    if not matches:
         return None
-    month, _day, year = m.groups()
+    month, _day, year = matches[1] if len(matches) >= 2 else matches[0]
     year = int(year)
     if year < 100:
         year += 2000
@@ -160,6 +163,32 @@ def find_col_index(headers, alias_key):
         if norm(alias) in normalized:
             return normalized.index(norm(alias))
     return None
+
+
+def find_latest_month_key(values_by_title):
+    """Scans every worksheet's Billing Period Analyzed values and returns
+    the MOST RECENT month_key actually found anywhere in the sheet.
+
+    This replaces a fixed 'today's month minus one' assumption, which
+    broke the first time the team got ahead of the calendar and started
+    working next month's tab early. Letting the sheet's real content
+    decide means this always follows wherever the team actually is,
+    whether exactly on pace, ahead, or behind - no calendar guesswork."""
+    latest = None
+    for values in values_by_title.values():
+        if not values:
+            continue
+        headers = values[0]
+        col_period = find_col_index(headers, "billing_period")
+        if col_period is None:
+            continue
+        for row in values[1:]:
+            if len(row) <= col_period:
+                continue
+            month_key = parse_billing_period(row[col_period])
+            if month_key and (latest is None or month_key > latest):
+                latest = month_key
+    return latest
 
 
 def find_current_month_worksheet(values_by_title, target_month_key):
@@ -426,7 +455,23 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
     gc = gspread.authorize(creds)
     spreadsheet = gc.open_by_key(SHEET_ID)
 
-    target_month = month_override or current_month_key()
+    values_by_title = {}
+    for ws in spreadsheet.worksheets():
+        try:
+            values_by_title[ws.title] = ws.get_all_values()
+            time.sleep(1.1)
+        except Exception as e:
+            print(f"Skipping worksheet '{ws.title}': {e}")
+
+    if month_override:
+        target_month = month_override
+    else:
+        target_month = find_latest_month_key(values_by_title)
+        if target_month is None:
+            print("Could not find ANY parseable billing period across the whole sheet - nothing to do.")
+            return
+        print(f"No --month override given - detected most recent billing period in the sheet: {target_month}")
+
     month_name = month_name_for(target_month)
 
     if as_of_day_override:
@@ -443,14 +488,6 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
     if dry_run:
         print(f"[DRY RUN] Testing month={target_month}, simulated today_day={today_day}. "
               f"No Asana calls or Supabase writes will be made.\n")
-
-    values_by_title = {}
-    for ws in spreadsheet.worksheets():
-        try:
-            values_by_title[ws.title] = ws.get_all_values()
-            time.sleep(1.1)
-        except Exception as e:
-            print(f"Skipping worksheet '{ws.title}': {e}")
 
     found = find_current_month_worksheet(values_by_title, target_month)
     if not found:
