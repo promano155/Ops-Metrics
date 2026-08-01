@@ -167,13 +167,30 @@ def find_col_index(headers, alias_key):
 
 def find_latest_month_key(values_by_title):
     """Scans every worksheet's Billing Period Analyzed values and returns
-    the MOST RECENT month_key actually found anywhere in the sheet.
+    the MOST RECENT month_key actually found anywhere in the sheet -
+    bounded to exactly two possible values: last month (the normal
+    cadence - July's invoices are processed in August) or this month
+    (the team started a few days early). Nothing else is physically
+    possible, since invoicing can't run ahead of a month that hasn't
+    happened yet, and can't run more than one month behind without
+    something being badly wrong.
 
-    This replaces a fixed 'today's month minus one' assumption, which
-    broke the first time the team got ahead of the calendar and started
-    working next month's tab early. Letting the sheet's real content
-    decide means this always follows wherever the team actually is,
-    whether exactly on pace, ahead, or behind - no calendar guesswork."""
+    This bound is what stops garbage data on an old or malformed tab
+    from hijacking the result (a real incident: a 2020 tab's data
+    parsed into '2038' and nearly became the target).
+
+    This replaces a fixed 'always previous calendar month' assumption,
+    which broke the first time the team got a few days ahead and started
+    working this month's tab before the calendar rolled over. Letting
+    the sheet's real content decide - within this tight, physically
+    correct bound - means this follows wherever the team actually is,
+    without trusting implausible outliers from years-old tabs."""
+    today = dt.date.today()
+    earliest_plausible = month_key_shift(today, -1)   # normal cadence: previous month
+    latest_plausible = month_key_shift(today, 0)       # early start: this month, never beyond -
+                                                        # invoicing can't run ahead of a month
+                                                        # that hasn't happened yet
+
     latest = None
     for values in values_by_title.values():
         if not values:
@@ -186,9 +203,20 @@ def find_latest_month_key(values_by_title):
             if len(row) <= col_period:
                 continue
             month_key = parse_billing_period(row[col_period])
-            if month_key and (latest is None or month_key > latest):
+            if month_key is None:
+                continue
+            if not (earliest_plausible <= month_key <= latest_plausible):
+                continue  # implausibly old/future - almost certainly garbage
+            if latest is None or month_key > latest:
                 latest = month_key
     return latest
+
+
+def month_key_shift(base_date, months):
+    """Returns the 'YYYY-MM' key for base_date shifted by +/- months."""
+    total = base_date.year * 12 + (base_date.month - 1) + months
+    year, month = divmod(total, 12)
+    return f"{year:04d}-{month + 1:02d}"
 
 
 def find_current_month_worksheet(values_by_title, target_month_key):
