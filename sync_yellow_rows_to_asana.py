@@ -121,6 +121,28 @@ def month_name_for(month_key):
     return calendar.month_name[month]
 
 
+def parse_utc_datetime(value):
+    """Parses a timestamp string coming back from Supabase into a naive
+    UTC datetime, so it stays comparable/addable with dt.datetime.utcnow()
+    everywhere else in this script.
+
+    Supabase's timestamptz columns come back suffixed like '+00:00' or
+    '+00', NOT with a literal 'Z' - so a bare .replace('Z', '') does
+    nothing to them, fromisoformat() parses the offset correctly and
+    returns a TIMEZONE-AWARE datetime, and then comparing or adding that
+    against utcnow() (naive) throws 'can't compare offset-naive and
+    offset-aware datetimes'. This was a real, if latent, incident."""
+    if value is None:
+        return None
+    value = value.strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    parsed = dt.datetime.fromisoformat(value)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 def parse_billing_period(value):
     """Returns the month from the SECOND date in the cell (the end of a
     '{start} - {end}' range), always - not whichever date is
@@ -426,7 +448,7 @@ def get_next_standard_batch_due_at(month_key, dry_run=False):
     rows = resp.json()
 
     if rows:
-        last_due_at = dt.datetime.fromisoformat(rows[0]["last_due_at"].replace("Z", ""))
+        last_due_at = parse_utc_datetime(rows[0]["last_due_at"])
         next_due_at = last_due_at + dt.timedelta(hours=24)
         next_sequence = rows[0]["sequence_number"] + 1
     else:
@@ -479,7 +501,7 @@ def get_or_create_batch_task_for_group(month_key, due_day_group, month_name, sec
 
     is_expired = False
     if state and state.get("due_at"):
-        due_at_dt = dt.datetime.fromisoformat(state["due_at"].replace("Z", ""))
+        due_at_dt = parse_utc_datetime(state["due_at"])
         is_expired = due_at_dt <= dt.datetime.utcnow()
 
     remaining = (BATCH_SIZE - state["task_count"]) if state else 0
@@ -654,7 +676,7 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
             state = get_batch_state(target_month, due_day_group)  # read-only, safe
             is_expired = False
             if state and state.get("due_at"):
-                due_at_dt = dt.datetime.fromisoformat(state["due_at"].replace("Z", ""))
+                due_at_dt = parse_utc_datetime(state["due_at"])
                 is_expired = due_at_dt <= dt.datetime.utcnow()
             remaining = (BATCH_SIZE - state["task_count"]) if state else 0
             count_needed = len(hotel_names)
