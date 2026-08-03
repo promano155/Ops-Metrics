@@ -300,8 +300,8 @@ def create_hotel_subtask(hotel_name, month_key, parent_task_gid):
     Inherits visibility from the parent - no project/section needed here."""
     payload = {
         "data": {
-            "name": f"Follow up: {hotel_name}",
-            "notes": f"Flagged yellow on the Curacity Billing Overview sheet for {month_key}.",
+            "name": hotel_name,
+            "notes": f"Flagged via 'Flag to Innova' on the Curacity Billing Overview sheet for {month_key}.",
         }
     }
     data = asana_request("POST", f"/tasks/{parent_task_gid}/subtasks", json=payload)
@@ -316,8 +316,8 @@ def create_standalone_priority_task(hotel_name, month_key, section_gid):
     rules like DRI auto-assignment, unlike subtasks)."""
     payload = {
         "data": {
-            "name": f"Follow up: {hotel_name}",
-            "notes": f"Flagged yellow (Data Priority) on the Curacity Billing Overview sheet for {month_key}.",
+            "name": hotel_name,
+            "notes": f"Flagged via 'Flag to Innova' (Data Priority) on the Curacity Billing Overview sheet for {month_key}.",
             "projects": [ASANA_PROJECT_GID],
             "memberships": [{"project": ASANA_PROJECT_GID, "section": section_gid}],
         }
