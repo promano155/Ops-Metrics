@@ -291,7 +291,13 @@ def create_batch_task(name, section_gid, due_at=None):
     }
     if due_at:
         payload["data"]["due_at"] = due_at
-    data = asana_request("POST", "/tasks", json=payload)
+        print(f"Sending due_at to Asana for '{name}': {due_at!r}")
+    # opt_fields is required here - Asana's API returns only a minimal
+    # field set by default, so without this the echo-back check below
+    # would always show None regardless of what was actually stored.
+    data = asana_request("POST", "/tasks", json=payload, params={"opt_fields": "due_at,due_on,name"})
+    if due_at:
+        print(f"Asana echoed back for '{name}': due_at={data.get('due_at')!r}, due_on={data.get('due_on')!r}")
     return data["gid"]
 
 
@@ -308,16 +314,25 @@ def create_hotel_subtask(hotel_name, month_key, parent_task_gid):
     return data["gid"]
 
 
-def create_standalone_priority_task(hotel_name, month_key, section_gid):
-    """For Data Priority = Yes rows: a real top-level task added directly
-    to the project/section, NOT a subtask - deliberately not nested, so
-    each one is its own 'task added to project' event (triggers a channel
-    ping per overdue-priority hotel, and reliably catches project-scoped
-    rules like DRI auto-assignment, unlike subtasks)."""
+def create_priority_summary_task(hotel_count, section_gid):
+    """For Data Priority = Yes rows: ONE parent task per run, titled with
+    the count (e.g. '5 hotels added to Priority'), so only ONE 'task
+    added to project' event fires - one channel notification per run,
+    not one per hotel. Each flagged hotel becomes a SUBTASK of this.
+
+    IMPORTANT UNVERIFIED RISK: subtasks have a known reliability gap with
+    Asana's own project-scoped rules (confirmed separately for the DRI-
+    assignment rule - subtasks sometimes don't reliably trigger rules
+    that top-level tasks do). If the SLA-breach alert rule on this
+    section is scoped the same way, nesting hotels here could silently
+    break individual breach alerts - the one thing this change was
+    explicitly supposed to preserve. Test this before trusting it live:
+    create one now, wait past its rule-assigned due date, confirm the
+    breach alert actually fires on the SUBTASK, not just the parent."""
+    label = f"{hotel_count} hotel{'s' if hotel_count != 1 else ''} added to Priority"
     payload = {
         "data": {
-            "name": hotel_name,
-            "notes": f"Flagged via 'Flag to Innova' (Data Priority) on the Curacity Billing Overview sheet for {month_key}.",
+            "name": label,
             "projects": [ASANA_PROJECT_GID],
             "memberships": [{"project": ASANA_PROJECT_GID, "section": section_gid}],
         }
@@ -432,7 +447,7 @@ def get_next_standard_batch_due_at(month_key, dry_run=False):
         )
         resp.raise_for_status()
 
-    return next_due_at.isoformat() + "Z", next_sequence
+    return next_due_at.replace(microsecond=0).isoformat() + "Z", next_sequence
 
 
 def get_or_create_batch_task_for_group(month_key, due_day_group, month_name, section_gid, count_needed,
@@ -611,16 +626,22 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         print("No new flagged rows to action.")
         return
 
-    # Pass 2a: Data Priority = Yes hotels - standalone tasks, straight
-    # into Priority, one "task added to project" event each.
-    for hotel_name in priority_flag_hotels:
+    # Pass 2a: Data Priority = Yes hotels - ONE summary parent task per
+    # run (e.g. "5 hotels added to Priority"), hotels nested as subtasks
+    # under it. This means exactly one "task added to project" event per
+    # run instead of one per hotel - one channel notification, not many.
+    if priority_flag_hotels:
         if dry_run:
-            print(f"[DRY RUN] Data Priority=Yes -> standalone task in 'Priority (Within 24hrs)' for '{hotel_name}'")
-            continue
-        dedup_key = f"{target_month}:{hotel_name}"
-        task_gid = create_standalone_priority_task(hotel_name, target_month, priority_section_gid)
-        record_actioned(dedup_key, target_month, hotel_name, task_gid, due_day_group="data_priority_flag")
-        print(f"Data Priority=Yes -> standalone task {task_gid} for '{hotel_name}'")
+            print(f"[DRY RUN] Would create summary task "
+                  f"'{len(priority_flag_hotels)} hotel(s) added to Priority' with subtasks: {priority_flag_hotels}")
+        else:
+            summary_task_gid = create_priority_summary_task(len(priority_flag_hotels), priority_section_gid)
+            print(f"Created priority summary task {summary_task_gid} for {len(priority_flag_hotels)} hotel(s)")
+            for hotel_name in priority_flag_hotels:
+                dedup_key = f"{target_month}:{hotel_name}"
+                subtask_gid = create_hotel_subtask(hotel_name, target_month, summary_task_gid)
+                record_actioned(dedup_key, target_month, hotel_name, subtask_gid, due_day_group="data_priority_flag")
+                print(f"Data Priority=Yes -> subtask {subtask_gid} under summary {summary_task_gid} for '{hotel_name}'")
 
     # Pass 2b: everything else - place each group's entire cohort into
     # one nested batch task (or simulate doing so, in dry-run mode).
