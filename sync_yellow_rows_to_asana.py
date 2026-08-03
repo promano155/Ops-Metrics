@@ -376,7 +376,7 @@ def get_batch_state(month_key, due_day_group):
     return rows[0] if rows else None
 
 
-def upsert_batch_state(month_key, due_day_group, batch_number, batch_task_gid, task_count):
+def upsert_batch_state(month_key, due_day_group, batch_number, batch_task_gid, task_count, due_at=None):
     payload = {
         "month_key": month_key,
         "due_day_group": due_day_group,
@@ -385,6 +385,8 @@ def upsert_batch_state(month_key, due_day_group, batch_number, batch_task_gid, t
         "task_count": task_count,
         "updated_at": dt.datetime.utcnow().isoformat(),
     }
+    if due_at is not None:
+        payload["due_at"] = due_at
     resp = requests.post(
         f"{SUPABASE_URL}/rest/v1/{BATCH_TABLE}",
         headers={**supabase_headers(), "Prefer": "resolution=merge-duplicates"},
@@ -439,10 +441,19 @@ def get_or_create_batch_task_for_group(month_key, due_day_group, month_name, sec
     from this run) into one batch task - never split across two.
 
     If the currently open batch has enough remaining room for ALL of
-    count_needed, they all go there. If not, a brand new batch task is
-    created for the WHOLE cohort, even if that leaves the previous batch
-    permanently short of 25. This is intentional: a due date is never
-    allowed to straddle two batches, even partially.
+    count_needed, AND its due date (if any) hasn't already passed, they
+    all go there. If not, a brand new batch task is created for the
+    WHOLE cohort, even if that leaves the previous batch permanently
+    short of 25. Same-due-date rows are never split across two batches,
+    even partially.
+
+    A batch whose due date has already passed is treated as CLOSED
+    regardless of how few subtasks it has. Due dates are set once, at
+    creation - a low-volume batch that takes days to fill would
+    otherwise let a hotel added on day 4 silently inherit a due date set
+    back on day 1, which could already be hours from expiring or already
+    past. Once expired, a fresh batch opens instead, with an honestly-
+    in-the-future due date.
 
     apply_staggered_due_date=True ONLY for 48hr SLA batches (never
     Priority, which has its own native-rule SLA) - see
@@ -450,12 +461,23 @@ def get_or_create_batch_task_for_group(month_key, due_day_group, month_name, sec
     Reusing an existing batch never touches its due date - only set once,
     at creation."""
     state = get_batch_state(month_key, due_day_group)
+
+    is_expired = False
+    if state and state.get("due_at"):
+        due_at_dt = dt.datetime.fromisoformat(state["due_at"].replace("Z", ""))
+        is_expired = due_at_dt <= dt.datetime.utcnow()
+
     remaining = (BATCH_SIZE - state["task_count"]) if state else 0
 
-    if state and remaining >= count_needed:
+    if state and not is_expired and remaining >= count_needed:
         new_count = state["task_count"] + count_needed
         upsert_batch_state(month_key, due_day_group, state["batch_number"], state["batch_task_gid"], new_count)
         return state["batch_task_gid"]
+
+    if state and is_expired:
+        print(f"Batch #{state['batch_number']} for '{due_day_group}' has an expired due date "
+              f"({state['due_at']}) with only {state['task_count']}/{BATCH_SIZE} filled - "
+              f"closing it and starting a fresh batch rather than silently inheriting a stale deadline.")
 
     next_batch_number = (state["batch_number"] + 1) if state else 1
     batch_name = f"{month_name} Batch {next_batch_number}"
@@ -466,7 +488,7 @@ def get_or_create_batch_task_for_group(month_key, due_day_group, month_name, sec
         print(f"Staggered due date for '{batch_name}': {due_at} (sequence #{sequence_number})")
 
     batch_task_gid = create_batch_task(batch_name, section_gid, due_at=due_at)
-    upsert_batch_state(month_key, due_day_group, next_batch_number, batch_task_gid, count_needed)
+    upsert_batch_state(month_key, due_day_group, next_batch_number, batch_task_gid, count_needed, due_at=due_at)
     print(f"Created new batch task '{batch_name}' for due-day group '{due_day_group}' ({count_needed} rows)")
     return batch_task_gid
 
@@ -609,16 +631,23 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
 
         if dry_run:
             state = get_batch_state(target_month, due_day_group)  # read-only, safe
+            is_expired = False
+            if state and state.get("due_at"):
+                due_at_dt = dt.datetime.fromisoformat(state["due_at"].replace("Z", ""))
+                is_expired = due_at_dt <= dt.datetime.utcnow()
             remaining = (BATCH_SIZE - state["task_count"]) if state else 0
             count_needed = len(hotel_names)
-            if state and remaining >= count_needed:
+            if state and not is_expired and remaining >= count_needed:
                 batch_label = f"{month_name} Batch {state['batch_number']}"
                 action = f"REUSE existing batch (currently {state['task_count']}/{BATCH_SIZE}, room for {remaining})"
                 due_note = "(due date unchanged - only set at creation)"
             else:
                 next_num = (state["batch_number"] + 1) if state else 1
                 batch_label = f"{month_name} Batch {next_num}"
-                action = "CREATE NEW batch" if state else "CREATE FIRST batch"
+                if state and is_expired:
+                    action = f"CREATE NEW batch (previous one EXPIRED at {state['due_at']}, was only {state['task_count']}/{BATCH_SIZE} full)"
+                else:
+                    action = "CREATE NEW batch" if state else "CREATE FIRST batch"
                 if apply_staggered_due_date:
                     projected_due_at, seq = get_next_standard_batch_due_at(target_month, dry_run=True)
                     due_note = f"(would set due_at={projected_due_at}, sequence #{seq})"
