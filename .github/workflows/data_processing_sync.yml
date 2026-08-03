@@ -12,6 +12,11 @@ on:
         description: 'Extra args for the yellow-row script, e.g. --list-colors or --dry-run --month 2026-06'
         required: false
         default: ''
+      skip_yellow_row:
+        description: 'Skip the yellow-row Asana step entirely (use this for manual/backfill runs of the other scripts, so real tickets and channel pings do not fire off-schedule)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   sync:
@@ -48,6 +53,7 @@ jobs:
         run: python sync_hubspot_ticket_sla.py
 
       - name: Run yellow-row Asana sync
+        if: ${{ github.event.inputs.skip_yellow_row != 'true' }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
