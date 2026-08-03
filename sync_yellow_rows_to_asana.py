@@ -654,8 +654,9 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
     # run instead of one per hotel - one channel notification, not many.
     if priority_flag_hotels:
         if dry_run:
-            print(f"[DRY RUN] Would create summary task "
-                  f"'{len(priority_flag_hotels)} hotel(s) added to Priority' with subtasks: {priority_flag_hotels}")
+            count = len(priority_flag_hotels)
+            label = f"{count} hotel{'s' if count != 1 else ''} added to Priority"
+            print(f"[DRY RUN] Would create summary task '{label}' with subtasks: {priority_flag_hotels}")
         else:
             summary_task_gid = create_priority_summary_task(len(priority_flag_hotels), priority_section_gid)
             print(f"Created priority summary task {summary_task_gid} for {len(priority_flag_hotels)} hotel(s)")
