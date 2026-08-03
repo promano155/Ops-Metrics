@@ -1,0 +1,35 @@
+name: Yellow-row Asana sync (standalone)
+
+# Manual-only, for fast testing/dry-runs of just this one script. The
+# real daily run still happens via data_processing_sync.yml alongside
+# the other three scripts - this file is purely a faster iteration tool
+# and is never triggered automatically.
+
+on:
+  workflow_dispatch:
+    inputs:
+      yellow_row_args:
+        description: 'Args for the script, e.g. --dry-run or --dry-run --month 2026-07'
+        required: false
+        default: '--dry-run'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install gspread google-auth requests
+
+      - name: Run yellow-row Asana sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          ASANA_PAT: ${{ secrets.ASANA_PAT }}
+        run: python sync_yellow_rows_to_asana.py ${{ github.event.inputs.yellow_row_args }}
