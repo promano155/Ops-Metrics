@@ -23,13 +23,23 @@ Run daily via GitHub Actions (see data-processing-sync.yml).
    matched by ALIAS, not fixed position. If a future tab renames a column
    again, add the new name to COLUMN_ALIASES below rather than touching the
    parsing logic.
-5. Locking: the current calendar month is recomputed and overwritten every
-   run. Any month before the current calendar month is written ONCE
-   (status='closed') and never silently overwritten again, even if the
-   underlying sheet is edited later. This protects numbers that have
+5. Locking: the current REPORTING month (one month ahead of whichever
+   billing period is actively being worked - see point 6) is recomputed
+   and overwritten every run. Any earlier reporting month is written
+   ONCE (status='closed') and never silently overwritten again, even if
+   the underlying sheet is edited later. This protects numbers that have
    already been reported out. To force a recompute of a closed month,
-   delete its row from the Supabase table (or add a --force-month flag,
-   see bottom of file) and re-run.
+   pass its REPORTING label (e.g. '2026-08') as a CLI arg, or delete its
+   row from the Supabase table.
+6. Billing period vs. reporting label: the tab this reads is named for
+   its billing period (July's billing period tab has rows dated
+   '7.1.26 - 7.31.26'), but the actual WORK of processing that billing
+   period happens the following month (July's invoices are processed in
+   August). This script reads and locates data by the billing period
+   exactly as labeled in the sheet - that part is unchanged - but stores
+   and displays the result under a REPORTING label one month later,
+   since "how fast did we process files" is a statement about the month
+   the work happened in, not the month being billed for.
 """
 
 import os
@@ -337,32 +347,66 @@ def month_key_n_back(n):
     return f"{year:04d}-{month:02d}"
 
 
-def main(force_months=None):
-    force_months = set(force_months or [])
-    current_month_key = month_key_n_back(0)
-    wanted_months = [month_key_n_back(n) for n in range(TRAILING_MONTHS + 1)]
+def shift_month_key(month_key, n):
+    """Shifts a 'YYYY-MM' key forward/back by n months. Used to convert
+    a billing-period month into its REPORTING label: work done processing
+    July's billing period happens in August, so it's reported as August's
+    throughput, not July's - the billing period itself is unaffected,
+    only the label this data is stored/displayed under."""
+    year, month = (int(x) for x in month_key.split("-"))
+    total = year * 12 + (month - 1) + n
+    year, month = divmod(total, 12)
+    return f"{year:04d}-{month + 1:02d}"
 
-    already_closed = fetch_existing_month_keys(status_filter="closed")
+
+def shift_month_key(month_key, n):
+    """Shifts a 'YYYY-MM' key forward (or back, if n is negative) by n
+    months. Used to convert a BILLING PERIOD (which tab/period was read
+    from the sheet) into a REPORTING label (which month's throughput this
+    counts toward on the dashboard) - these are deliberately different:
+    July's billing period is processed in August, so July's billing-
+    period data should be labeled and displayed as August's result."""
+    year, month = (int(x) for x in month_key.split("-"))
+    total = year * 12 + (month - 1) + n
+    year, month = divmod(total, 12)
+    return f"{year:04d}-{month + 1:02d}"
+
+
+def main(force_months=None):
+    force_months = set(force_months or [])  # these are REPORTING labels, e.g. '2026-08'
+    current_billing_period = month_key_n_back(0)  # the billing period actively being worked right now
+    wanted_billing_periods = [month_key_n_back(n) for n in range(TRAILING_MONTHS + 1)]
+
+    already_closed = fetch_existing_month_keys(status_filter="closed")  # these are REPORTING labels too
 
     gc = get_gspread_client()
     spreadsheet = gc.open_by_key(SHEET_ID)
 
-    aggs = extract_month_aggregates(spreadsheet, wanted_months)
+    aggs = extract_month_aggregates(spreadsheet, wanted_billing_periods)
 
-    for month_key in wanted_months:
-        agg = aggs.get(month_key)
+    for billing_period in wanted_billing_periods:
+        agg = aggs.get(billing_period)
         if agg is None or agg.rows_seen == 0:
-            continue  # no data found for this month in the sheet yet/anymore
+            continue  # no data found for this billing period in the sheet yet/anymore
 
-        if month_key == current_month_key:
-            upsert_month(month_key, agg, status="current")
-        elif month_key in already_closed and month_key not in force_months:
+        # The billing period itself is correct as read - only the LABEL
+        # this gets stored/displayed under shifts forward one month.
+        # Processing July's billing period happens in August, so this
+        # data is August's throughput number, not July's.
+        report_month_key = shift_month_key(billing_period, 1)
+
+        if billing_period == current_billing_period:
+            upsert_month(report_month_key, agg, status="current")
+        elif report_month_key in already_closed and report_month_key not in force_months:
             continue  # locked - do not silently change already-reported numbers
         else:
-            upsert_month(month_key, agg, status="closed")
+            upsert_month(report_month_key, agg, status="closed")
 
 
 if __name__ == "__main__":
-    # Optional: python sync_data_processing_metrics.py 2026-05 2026-04
-    # forces a recompute of specific already-closed months.
+    # Optional: python sync_data_processing_metrics.py 2026-08 2026-07
+    # forces a recompute of specific already-closed months. These are
+    # REPORTING labels (what you see on the dashboard), not billing
+    # periods - e.g. pass '2026-08' to force-recompute August's row,
+    # which is built from July's billing-period tab.
     main(force_months=sys.argv[1:])
