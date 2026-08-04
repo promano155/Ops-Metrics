@@ -1,0 +1,36 @@
+name: Backfill Monthly Revenue Impact (one-time)
+
+# Manual-only, one-time backfill - never scheduled, never part of the
+# daily automation. Run --dry-run first; this writes to real, live tasks.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview only, no writes (uncheck to actually run it for real)'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run backfill
+        env:
+          ASANA_PAT: ${{ secrets.ASANA_PAT }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python backfill_revenue_impact.py --dry-run
+          else
+            python backfill_revenue_impact.py
+          fi
