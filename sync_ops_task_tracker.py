@@ -74,6 +74,7 @@ SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 STATE_TABLE = "ops_task_state"
 MONTHLY_TABLE = "ops_monthly_person_counts"
+OVERDUE_EVENTS_TABLE = "ops_overdue_events"
 
 SLA_BUSINESS_DAYS = 1
 
@@ -214,18 +215,40 @@ def get_all_task_state():
     return {row["task_gid"]: row for row in resp.json()}
 
 
-def upsert_task_state(task_gid, assignee, current_section, last_section_change_at, completed_at):
+def upsert_task_state(task_gid, assignee, current_section, last_section_change_at, completed_at, was_overdue):
     payload = {
         "task_gid": task_gid,
         "assignee": assignee,
         "current_section": current_section,
         "last_section_change_at": last_section_change_at.isoformat(),
         "completed_at": completed_at.isoformat() if completed_at else None,
+        "was_overdue": was_overdue,
         "updated_at": dt.datetime.utcnow().isoformat(),
     }
     resp = requests.post(
         f"{SUPABASE_URL}/rest/v1/{STATE_TABLE}",
         headers={**supabase_headers(), "Prefer": "resolution=merge-duplicates"},
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+
+def record_overdue_event(task_gid, task_name, assignee):
+    """Logs ONE row per distinct overdue incident - called only at the
+    moment a task transitions from on-time to overdue, not on every run
+    while it remains overdue. If it later gets fixed and goes overdue
+    again, that's a new, separate incident. Week/month/quarter rollups
+    are computed at query time from occurred_at - no pre-bucketing here."""
+    payload = {
+        "task_gid": task_gid,
+        "task_name": task_name,
+        "assignee": assignee,
+        "occurred_at": dt.datetime.utcnow().isoformat(),
+    }
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{OVERDUE_EVENTS_TABLE}",
+        headers=supabase_headers(),
         json=payload,
         timeout=30,
     )
@@ -298,6 +321,7 @@ def main(force_digest=False):
     # Track for digest + monthly counts as we go, one pass.
     open_by_assignee = {}
     overdue_by_assignee = {}
+    overdue_tasks = []  # (task_name, assignee) pairs for the digest - not just a count
     completed_this_week_by_assignee = {}
     monthly_assigned = {}
     monthly_completed = {}
@@ -329,7 +353,21 @@ def main(force_digest=False):
         # been sitting there unchanged since a prior run).
         effective_completed_at = last_section_change_at if is_done else None
 
-        upsert_task_state(task_gid, assignee, current_section, last_section_change_at, effective_completed_at)
+        # --- Overdue transition detection - BEFORE we potentially reset
+        # due_on below, so this reflects whether it was ALREADY overdue
+        # at the start of this run, not an artifact of our own reset.
+        due_on_before_reset = task.get("due_on")
+        is_overdue_now = (
+            not is_done and due_on_before_reset is not None
+            and dt.date.fromisoformat(due_on_before_reset) < today
+        )
+        was_overdue_before = bool(prior and prior.get("was_overdue"))
+        if is_overdue_now and not was_overdue_before:
+            record_overdue_event(task_gid, task["name"], assignee)
+            print(f"NEW overdue incident logged for '{task['name']}' ({assignee})")
+
+        upsert_task_state(task_gid, assignee, current_section, last_section_change_at,
+                           effective_completed_at, is_overdue_now)
 
         # --- SLA due-date reset: only touch due_on when something real
         # changed, so Asana's own overdue-red does the rest passively.
@@ -342,9 +380,9 @@ def main(force_digest=False):
         # --- Digest tallies ---
         if not is_done:
             open_by_assignee[assignee] = open_by_assignee.get(assignee, 0) + 1
-            due_on = task.get("due_on")
-            if due_on and dt.date.fromisoformat(due_on) < today:
+            if is_overdue_now:
                 overdue_by_assignee[assignee] = overdue_by_assignee.get(assignee, 0) + 1
+                overdue_tasks.append((task["name"], assignee))
         if current_section is not None and current_section.lower() == SECTION_NAMES["blocked"].lower():
             if not get_blocked_reason(task):
                 blocked_without_reason.append((task["name"], assignee))
@@ -371,6 +409,10 @@ def main(force_digest=False):
                 f"overdue: {overdue_by_assignee.get(person, 0)}, "
                 f"completed this week: {completed_this_week_by_assignee.get(person, 0)}"
             )
+        if overdue_tasks:
+            lines.append("\n*Overdue (open >1 business day, no status change):*")
+            for name, assignee in overdue_tasks:
+                lines.append(f"- {name} ({assignee})")
         if blocked_without_reason:
             lines.append("\n*Blocked with no reason noted:*")
             for name, assignee in blocked_without_reason:
