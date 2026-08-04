@@ -281,7 +281,7 @@ def send_slack_dm(text):
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main(force_digest=False):
     now = dt.datetime.utcnow()
     today = now.date()
 
@@ -359,7 +359,7 @@ def main():
             monthly_days_open.setdefault(assignee, []).append(days_open)
 
     # --- Friday-only digest ---
-    if today.weekday() == 4:  # Monday=0 ... Friday=4
+    if today.weekday() == 4 or force_digest:  # Monday=0 ... Friday=4
         lines = ["*Weekly ops task digest*"]
         all_assignees = sorted(set(open_by_assignee) | set(overdue_by_assignee) | set(completed_this_week_by_assignee))
         if not all_assignees:
@@ -391,4 +391,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force-digest", action="store_true",
+                         help="Send the digest regardless of day-of-week, for testing.")
+    args = parser.parse_args()
+    main(force_digest=args.force_digest)
