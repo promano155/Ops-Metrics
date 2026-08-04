@@ -377,8 +377,17 @@ def supabase_headers():
 
 
 def already_actioned(dedup_key):
-    url = f"{SUPABASE_URL}/rest/v1/{DEDUP_TABLE}?dedup_key=eq.{dedup_key}&select=dedup_key"
-    resp = requests.get(url, headers=supabase_headers(), timeout=30)
+    """Uses params= so requests properly URL-encodes dedup_key - hotel
+    names routinely contain commas and ampersands ('Resort & Suites',
+    'Sky Rock Sedona, a Tribute Portfolio Hotel'), and an unencoded '&'
+    in a manually-built URL string starts a NEW query parameter instead
+    of being part of the value. That silently broke this exact check for
+    every hotel with such a character in its name - it would always come
+    back 'not found' even for genuinely already-actioned hotels, which is
+    precisely how this produced systemic, not occasional, duplicates."""
+    url = f"{SUPABASE_URL}/rest/v1/{DEDUP_TABLE}"
+    params = {"dedup_key": f"eq.{dedup_key}", "select": "dedup_key"}
+    resp = requests.get(url, headers=supabase_headers(), params=params, timeout=30)
     resp.raise_for_status()
     return len(resp.json()) > 0
 
