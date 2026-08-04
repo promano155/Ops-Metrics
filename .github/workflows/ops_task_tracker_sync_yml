@@ -1,0 +1,30 @@
+name: Ops task tracker sync
+
+on:
+  schedule:
+    # 12:00 UTC daily, weekdays only. Separate time from the EOD combined
+    # workflow on purpose - this is a lean, single-script job, not meant
+    # to run as often or carry as many steps as the billing pipeline.
+    - cron: "0 12 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run ops task tracker sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          ASANA_PAT: ${{ secrets.ASANA_PAT }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: python sync_ops_task_tracker.py
