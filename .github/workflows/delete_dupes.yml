@@ -1,0 +1,36 @@
+name: Delete duplicate hotel tasks
+
+# Manual-only, dry-run by default - this deletes real, live tasks when
+# the box is unchecked. Never scheduled.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview only, no deletions (uncheck to actually delete for real)'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run duplicate deletion
+        env:
+          ASANA_PAT: ${{ secrets.ASANA_PAT }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python delete_duplicate_hotel_tasks.py --dry-run
+          else
+            python delete_duplicate_hotel_tasks.py
+          fi
