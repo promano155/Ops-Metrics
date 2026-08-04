@@ -6,7 +6,13 @@ on:
     # workflow on purpose - this is a lean, single-script job, not meant
     # to run as often or carry as many steps as the billing pipeline.
     - cron: "0 12 * * 1-5"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_digest:
+        description: 'Send the digest now regardless of day-of-week (for testing)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   sync:
@@ -27,4 +33,9 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           ASANA_PAT: ${{ secrets.ASANA_PAT }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-        run: python sync_ops_task_tracker.py
+        run: |
+          if [ "${{ github.event.inputs.force_digest }}" = "true" ]; then
+            python sync_ops_task_tracker.py --force-digest
+          else
+            python sync_ops_task_tracker.py
+          fi
