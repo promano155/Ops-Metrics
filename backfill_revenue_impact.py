@@ -98,7 +98,7 @@ def fetch_top_level_tasks():
         next_page = body.get("next_page")
         if not next_page:
             break
-        params = {"offset": next_page["offset"], "opt_fields": OPT_FIELDS, "limit": 100}
+        params = {"project": PROJECT_GID, "opt_fields": OPT_FIELDS, "limit": 100, "offset": next_page["offset"]}
         time.sleep(0.2)
     return tasks
 
