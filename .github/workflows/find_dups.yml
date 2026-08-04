@@ -1,0 +1,24 @@
+name: Find duplicate hotel tasks (read-only)
+
+# Manual-only, read-only report - never scheduled, never writes anything.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run duplicate sweep
+        env:
+          ASANA_PAT: ${{ secrets.ASANA_PAT }}
+        run: python find_duplicate_hotel_tasks.py
