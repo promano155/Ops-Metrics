@@ -232,13 +232,14 @@ def upsert_task_state(task_gid, assignee, current_section, last_section_change_a
     resp.raise_for_status()
 
 
-def upsert_monthly_count(month_key, assignee, assigned, completed, avg_days_open, status):
+def upsert_monthly_count(month_key, assignee, assigned, completed, avg_days_open, currently_overdue, status):
     payload = {
         "month_key": month_key,
         "assignee": assignee,
         "tasks_assigned": assigned,
         "tasks_completed": completed,
         "avg_days_open": avg_days_open,
+        "currently_overdue": currently_overdue,
         "status": status,
         "updated_at": dt.datetime.utcnow().isoformat(),
     }
@@ -380,13 +381,14 @@ def main(force_digest=False):
     # --- Monthly counts, same current/closed lock pattern as everything else ---
     already_closed = fetch_closed_months()
     status = "closed" if month_key in already_closed else "current"
-    all_people = sorted(set(monthly_assigned) | set(monthly_completed))
+    all_people = sorted(set(monthly_assigned) | set(monthly_completed) | set(overdue_by_assignee))
     for person in all_people:
         assigned = monthly_assigned.get(person, 0)
         completed = monthly_completed.get(person, 0)
         days_list = monthly_days_open.get(person, [])
         avg_days = round(sum(days_list) / len(days_list), 1) if days_list else None
-        upsert_monthly_count(month_key, person, assigned, completed, avg_days, status)
+        overdue = overdue_by_assignee.get(person, 0)
+        upsert_monthly_count(month_key, person, assigned, completed, avg_days, overdue, status)
     print(f"Upserted monthly counts for {len(all_people)} people ({month_key}, {status}).")
 
 
