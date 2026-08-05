@@ -5,8 +5,14 @@ Companion to find_duplicate_hotel_tasks.py - same exact grouping logic
 (same hotel name, same calendar month based on created_at), so the two
 scripts can never disagree on what counts as a duplicate.
 
-For every group with more than one occurrence, keeps the EARLIEST one
-and deletes the rest.
+Resolution rule: if ANY occurrence in a duplicate group currently lives
+under a parent in the "Priority (Within 24hrs)" section, that one is
+ALWAYS kept (earliest among Priority ones, if more than one) and every
+other occurrence is deleted - regardless of creation order. This matters
+because a hotel that became priority after already being routed into a
+regular batch should have the Priority copy win, not whichever was
+created first. Only falls back to plain "keep earliest" when no
+occurrence in the group is in Priority at all.
 
 Run --dry-run first. Deletion is irreversible - this is not something to
 run blind, even though it's scoped narrowly to genuine duplicates.
@@ -33,6 +39,7 @@ import requests
 
 ASANA_TOKEN = os.environ["ASANA_PAT"]
 PROJECT_GID = "1207448572741662"  # Data Processing Requests
+PRIORITY_SECTION_NAME = "Priority (Within 24hrs)"
 OPT_FIELDS = "name,created_at,parent.name,permalink_url"
 
 
@@ -70,6 +77,49 @@ def asana_delete_task(task_gid):
         resp.raise_for_status()
         return
     raise RuntimeError("Still rate limited after 5 retries")
+
+
+def get_task_section(task_gid, cache):
+    """Looks up which section a task (a batch/summary parent) currently
+    sits in, caching by gid so each unique parent is only fetched once
+    even though it may show up across many duplicate groups."""
+    if task_gid in cache:
+        return cache[task_gid]
+    url = f"https://app.asana.com/api/1.0/tasks/{task_gid}"
+    resp = requests.get(url, headers=asana_headers(), params={"opt_fields": "memberships.section.name"}, timeout=30)
+    resp.raise_for_status()
+    memberships = resp.json()["data"].get("memberships", [])
+    section_name = None
+    for m in memberships:
+        section = m.get("section")
+        if section:
+            section_name = section.get("name")
+            break
+    cache[task_gid] = section_name
+    return section_name
+
+
+def choose_keeper(items, section_cache):
+    """Priority-section occurrences always win, regardless of creation
+    order - a hotel that became priority after already being routed into
+    a regular batch should keep the Priority copy, not whichever
+    happened to be created first. Falls back to keep-earliest only when
+    nothing in the group is in Priority at all."""
+    priority_items = []
+    for item in items:
+        parent = item.get("parent")
+        if not parent:
+            continue
+        section_name = get_task_section(parent["gid"], section_cache)
+        if section_name and section_name.strip().lower() == PRIORITY_SECTION_NAME.strip().lower():
+            priority_items.append(item)
+
+    if priority_items:
+        priority_items.sort(key=lambda t: t["created_at"])
+        return priority_items[0], "kept: in Priority section"
+
+    items_sorted = sorted(items, key=lambda t: t["created_at"])
+    return items_sorted[0], "kept: earliest (no Priority-section occurrence in this group)"
 
 
 def normalize_name(name):
@@ -133,17 +183,17 @@ def main(dry_run=False):
 
     total_to_delete = sum(len(v) - 1 for v in duplicate_groups.values())
     print(f"Found {len(duplicate_groups)} hotel(s) with duplicates - "
-          f"{'would delete' if dry_run else 'deleting'} {total_to_delete} extra task(s), "
-          f"keeping the earliest occurrence in each group.\n")
+          f"{'would delete' if dry_run else 'deleting'} {total_to_delete} extra task(s). "
+          f"Priority-section occurrences are always kept over regular batches.\n")
 
+    section_cache = {}
     deleted = 0
     for (hotel, month), items in sorted(duplicate_groups.items(), key=lambda kv: -len(kv[1])):
-        items_sorted = sorted(items, key=lambda t: t["created_at"])
-        keep = items_sorted[0]
-        to_delete = items_sorted[1:]
+        keep, reason = choose_keeper(items, section_cache)
+        to_delete = [item for item in items if item["gid"] != keep["gid"]]
 
         print(f"'{hotel.title()}' - {month}:")
-        print(f"    KEEPING: {keep['created_at']}  {keep['permalink_url']}")
+        print(f"    KEEPING ({reason}): {keep['created_at']}  {keep['permalink_url']}")
         for item in to_delete:
             parent_name = (item.get("parent") or {}).get("name", "(no parent)")
             if dry_run:
