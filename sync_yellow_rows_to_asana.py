@@ -72,6 +72,7 @@ import json
 import time
 import calendar
 import datetime as dt
+from zoneinfo import ZoneInfo
 
 import requests
 from google.oauth2.service_account import Credentials
@@ -95,6 +96,13 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 DEDUP_TABLE = "yellow_row_asana_tasks"
 BATCH_TABLE = "asana_batch_sections"
 STANDARD_BATCH_SEQUENCE_TABLE = "standard_sla_batch_sequence"
+PRIORITY_BATCH_TABLE = "priority_summary_batches"
+
+EASTERN = ZoneInfo("America/New_York")
+PRIORITY_CUTOFF_HOUR = 15  # 3pm ET - accumulate into the same priority
+                           # batch until this hour, then roll over to a
+                           # fresh one (with its own fresh 24h SLA, via
+                           # the existing native rule on that section)
 
 TRUE_VALUES = {"true", "yes", "y", "1", "checked"}
 
@@ -336,21 +344,19 @@ def create_hotel_subtask(hotel_name, month_key, parent_task_gid):
     return data["gid"]
 
 
-def create_priority_summary_task(hotel_count, section_gid):
-    """For Data Priority = Yes rows: ONE parent task per run, titled with
-    the count (e.g. '5 hotels added to Priority'), so only ONE 'task
-    added to project' event fires - one channel notification per run,
-    not one per hotel. Each flagged hotel becomes a SUBTASK of this.
+def priority_bucket_key(now_utc):
+    """Buckets 'now' into a half-day window in US Eastern time: midnight
+    to 2:59:59pm ET = 'AM', 3:00pm to 11:59:59pm ET = 'PM'. Uses
+    zoneinfo (not a fixed offset) so this is correct across the EST/EDT
+    changeover automatically, rather than drifting an hour twice a year."""
+    now_eastern = now_utc.replace(tzinfo=dt.timezone.utc).astimezone(EASTERN)
+    half = "AM" if now_eastern.hour < PRIORITY_CUTOFF_HOUR else "PM"
+    return f"{now_eastern.date().isoformat()}-{half}"
 
-    IMPORTANT UNVERIFIED RISK: subtasks have a known reliability gap with
-    Asana's own project-scoped rules (confirmed separately for the DRI-
-    assignment rule - subtasks sometimes don't reliably trigger rules
-    that top-level tasks do). If the SLA-breach alert rule on this
-    section is scoped the same way, nesting hotels here could silently
-    break individual breach alerts - the one thing this change was
-    explicitly supposed to preserve. Test this before trusting it live:
-    create one now, wait past its rule-assigned due date, confirm the
-    breach alert actually fires on the SUBTASK, not just the parent."""
+
+def create_priority_summary_task(hotel_count, section_gid):
+    """Creates a brand new priority batch parent with the given count
+    baked into its title."""
     label = f"{hotel_count} hotel{'s' if hotel_count != 1 else ''} added to Priority"
     payload = {
         "data": {
@@ -361,6 +367,38 @@ def create_priority_summary_task(hotel_count, section_gid):
     }
     data = asana_request("POST", "/tasks", json=payload)
     return data["gid"]
+
+
+def rename_task(task_gid, new_name):
+    asana_request("PUT", f"/tasks/{task_gid}", json={"data": {"name": new_name}})
+
+
+def get_or_create_priority_summary_task(bucket_key, additional_count, section_gid):
+    """Accumulates into the same priority batch for this half-day window
+    (renaming its title to reflect the running total each time more get
+    added), or creates a fresh one if this window hasn't started yet.
+    Each new window gets a brand new parent task, which means a brand
+    new 'task added to project' event - triggering a fresh 24h SLA via
+    the existing native rule on this section, exactly the rollover
+    behavior wanted at the 3pm cutoff.
+
+    IMPORTANT UNVERIFIED RISK (still applies to every hotel subtask
+    added here, confirmed separately as actually working): subtasks
+    reliably trigger this section's SLA-breach rule, confirmed in
+    testing - that's why this remains safe to keep using subtasks for
+    individual hotels regardless of how many times this parent gets
+    reused across a single window."""
+    state = get_priority_batch_state(bucket_key)
+    if state:
+        new_total = state["hotel_count"] + additional_count
+        new_label = f"{new_total} hotel{'s' if new_total != 1 else ''} added to Priority"
+        rename_task(state["summary_task_gid"], new_label)
+        upsert_priority_batch_state(bucket_key, state["summary_task_gid"], new_total)
+        return state["summary_task_gid"]
+    else:
+        summary_task_gid = create_priority_summary_task(additional_count, section_gid)
+        upsert_priority_batch_state(bucket_key, summary_task_gid, additional_count)
+        return summary_task_gid
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +441,31 @@ def record_actioned(dedup_key, month_key, hotel_name, subtask_gid, due_day_group
     }
     resp = requests.post(
         f"{SUPABASE_URL}/rest/v1/{DEDUP_TABLE}",
+        headers={**supabase_headers(), "Prefer": "resolution=merge-duplicates"},
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+
+def get_priority_batch_state(bucket_key):
+    url = f"{SUPABASE_URL}/rest/v1/{PRIORITY_BATCH_TABLE}"
+    params = {"bucket_key": f"eq.{bucket_key}", "select": "*"}
+    resp = requests.get(url, headers=supabase_headers(), params=params, timeout=30)
+    resp.raise_for_status()
+    rows = resp.json()
+    return rows[0] if rows else None
+
+
+def upsert_priority_batch_state(bucket_key, summary_task_gid, hotel_count):
+    payload = {
+        "bucket_key": bucket_key,
+        "summary_task_gid": summary_task_gid,
+        "hotel_count": hotel_count,
+        "updated_at": dt.datetime.utcnow().isoformat(),
+    }
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{PRIORITY_BATCH_TABLE}",
         headers={**supabase_headers(), "Prefer": "resolution=merge-duplicates"},
         json=payload,
         timeout=30,
@@ -615,9 +678,8 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
 
     # Pass 1: figure out which rows are new (Flag to Innova checked, not
     # yet actioned). Split into two paths:
-    #  - Data Priority = Yes -> standalone task, straight to Priority,
-    #    never nested/batched (confirmed decision - these ping the
-    #    channel individually and reliably hit project-scoped rules).
+    #  - Data Priority = Yes -> nested under a time-bucketed summary
+    #    batch (accumulates until the 3pm ET rollover - see Pass 2a).
     #  - everything else -> grouped by due_day_group for nested batching,
     #    exactly as originally designed.
     priority_flag_hotels = []
@@ -657,23 +719,34 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         print("No new flagged rows to action.")
         return
 
-    # Pass 2a: Data Priority = Yes hotels - ONE summary parent task per
-    # run (e.g. "5 hotels added to Priority"), hotels nested as subtasks
-    # under it. This means exactly one "task added to project" event per
-    # run instead of one per hotel - one channel notification, not many.
+    # Pass 2a: Data Priority = Yes hotels - accumulate into ONE summary
+    # parent per half-day window (midnight-3pm ET, then 3pm-midnight ET),
+    # instead of a brand new one every single run. This means multiple
+    # runs during the same window land in the same batch with a single
+    # shared "task added to project" event (one notification, not a
+    # scattered one per run), while the window boundary at 3pm still
+    # rolls into a genuinely fresh parent - which triggers its own fresh
+    # 24h SLA via the existing native rule on this section.
     if priority_flag_hotels:
+        bucket_key = priority_bucket_key(dt.datetime.utcnow())
         if dry_run:
-            count = len(priority_flag_hotels)
-            label = f"{count} hotel{'s' if count != 1 else ''} added to Priority"
-            print(f"[DRY RUN] Would create summary task '{label}' with subtasks: {priority_flag_hotels}")
+            state = get_priority_batch_state(bucket_key)  # read-only peek, safe in dry-run
+            existing_count = state["hotel_count"] if state else 0
+            action = "ADD to existing" if state else "CREATE NEW"
+            new_total = existing_count + len(priority_flag_hotels)
+            print(f"[DRY RUN] Would {action} priority batch for window '{bucket_key}' "
+                  f"(currently {existing_count} hotel(s)) -> new total {new_total}: {priority_flag_hotels}")
         else:
-            summary_task_gid = create_priority_summary_task(len(priority_flag_hotels), priority_section_gid)
-            print(f"Created priority summary task {summary_task_gid} for {len(priority_flag_hotels)} hotel(s)")
+            summary_task_gid = get_or_create_priority_summary_task(
+                bucket_key, len(priority_flag_hotels), priority_section_gid
+            )
+            print(f"Priority window '{bucket_key}' -> summary task {summary_task_gid}")
             for hotel_name in priority_flag_hotels:
                 dedup_key = f"{target_month}:{hotel_name}"
                 subtask_gid = create_hotel_subtask(hotel_name, target_month, summary_task_gid)
                 record_actioned(dedup_key, target_month, hotel_name, subtask_gid, due_day_group="data_priority_flag")
-                print(f"Data Priority=Yes -> subtask {subtask_gid} under summary {summary_task_gid} for '{hotel_name}'")
+                print(f"Data Priority=Yes -> subtask {subtask_gid} under priority window "
+                      f"'{bucket_key}' for '{hotel_name}'")
 
     # Pass 2b: everything else - place each group's entire cohort into
     # one nested batch task (or simulate doing so, in dry-run mode).
