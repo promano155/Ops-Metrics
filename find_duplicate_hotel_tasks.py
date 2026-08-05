@@ -8,10 +8,15 @@ signature. The same hotel appearing in different months (June AND July)
 is expected and NOT flagged - that's just the normal monthly cycle, not
 a bug.
 
+Reports which occurrence WOULD be kept using the same priority-section-
+aware rule as delete_duplicate_hotel_tasks.py: a Priority-section
+occurrence always wins over a regular batch, regardless of creation
+order, since a hotel that became priority after already being routed
+into a batch should keep the Priority copy. Falls back to keep-earliest
+only when nothing in the group is in Priority.
+
 Does not delete anything. Prints a clear report grouped by hotel+month,
-with each duplicate's parent batch name and a direct Asana link, so they
-can be reviewed and removed by hand (or ask for a companion delete
-script once you've reviewed this list).
+with each duplicate's parent batch name and a direct Asana link.
 """
 
 import os
@@ -22,6 +27,7 @@ import requests
 
 ASANA_TOKEN = os.environ["ASANA_PAT"]
 PROJECT_GID = "1207448572741662"  # Data Processing Requests
+PRIORITY_SECTION_NAME = "Priority (Within 24hrs)"
 OPT_FIELDS = "name,created_at,parent.name,permalink_url"
 
 
@@ -43,6 +49,41 @@ def asana_get(path, params):
         resp.raise_for_status()
         return resp.json()
     raise RuntimeError("Still rate limited after 5 retries")
+
+
+def get_task_section(task_gid, cache):
+    if task_gid in cache:
+        return cache[task_gid]
+    url = f"https://app.asana.com/api/1.0/tasks/{task_gid}"
+    resp = requests.get(url, headers=asana_headers(), params={"opt_fields": "memberships.section.name"}, timeout=30)
+    resp.raise_for_status()
+    memberships = resp.json()["data"].get("memberships", [])
+    section_name = None
+    for m in memberships:
+        section = m.get("section")
+        if section:
+            section_name = section.get("name")
+            break
+    cache[task_gid] = section_name
+    return section_name
+
+
+def choose_keeper(items, section_cache):
+    priority_items = []
+    for item in items:
+        parent = item.get("parent")
+        if not parent:
+            continue
+        section_name = get_task_section(parent["gid"], section_cache)
+        if section_name and section_name.strip().lower() == PRIORITY_SECTION_NAME.strip().lower():
+            priority_items.append(item)
+
+    if priority_items:
+        priority_items.sort(key=lambda t: t["created_at"])
+        return priority_items[0], "in Priority section"
+
+    items_sorted = sorted(items, key=lambda t: t["created_at"])
+    return items_sorted[0], "earliest (no Priority-section occurrence)"
 
 
 def normalize_name(name):
@@ -108,13 +149,16 @@ def main():
 
     total_extra = sum(len(v) - 1 for v in duplicate_groups.values())
     print(f"Found {len(duplicate_groups)} hotel(s) with duplicates, "
-          f"{total_extra} extra task(s) beyond the first legitimate one:\n")
+          f"{total_extra} extra task(s) beyond the one that would be kept:\n")
 
+    section_cache = {}
     for (hotel, month), items in sorted(duplicate_groups.items(), key=lambda kv: -len(kv[1])):
+        keep, reason = choose_keeper(items, section_cache)
         print(f"'{hotel.title()}' - {month} - {len(items)} occurrences:")
         for item in sorted(items, key=lambda t: t["created_at"]):
             parent_name = (item.get("parent") or {}).get("name", "(no parent)")
-            print(f"    - {item['created_at']}  under '{parent_name}'  {item['permalink_url']}")
+            marker = f"WOULD KEEP ({reason})" if item["gid"] == keep["gid"] else "would delete"
+            print(f"    [{marker}] {item['created_at']}  under '{parent_name}'  {item['permalink_url']}")
         print()
 
 
