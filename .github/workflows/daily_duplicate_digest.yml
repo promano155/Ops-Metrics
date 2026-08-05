@@ -1,0 +1,28 @@
+name: Daily duplicate digest
+
+on:
+  schedule:
+    # 12:00 UTC daily. Separate from the main billing pipeline's schedule
+    # on purpose - this is its own lean, single-purpose job.
+    - cron: "0 12 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run daily duplicate digest
+        env:
+          ASANA_PAT: ${{ secrets.ASANA_PAT }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          AUTO_DEDUPE: ${{ vars.AUTO_DEDUPE }}
+        run: python daily_duplicate_digest.py
