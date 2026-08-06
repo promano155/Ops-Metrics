@@ -92,6 +92,12 @@ SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 ASANA_TOKEN = os.environ["ASANA_PAT"]
 ASANA_PROJECT_GID = "1207448572741662"  # Data Processing Requests
 PRIORITY_SECTION_NAME = "Priority (Within 24hrs)"  # due today/overdue
+# "Data Automated" mirrors the sheet's checkbox column. Asana has no
+# native boolean/checkbox custom field type - this is the standard
+# workaround: a single-select field with exactly ONE option. Selected =
+# checked/true, left blank = unchecked/false.
+DATA_AUTOMATED_FIELD_GID = "1217236216436084"
+DATA_AUTOMATED_YES_OPTION_GID = "1217236216436085"
 STANDARD_SECTION_NAME = "48 hr SLA"                # everything else
 BATCH_SIZE = 25
 
@@ -109,6 +115,7 @@ COLUMN_ALIASES = {
     "priority_due_date": ["Priority Due Date"],
     "data_priority": ["Data Priority"],
     "flag_to_innova": ["Flag to Innova"],
+    "data_automated": ["Data Automated"],
 }
 
 # ---------------------------------------------------------------------------
@@ -251,13 +258,14 @@ def find_current_month_worksheet(values_by_title, target_month_key):
         col_due = find_col_index(headers, "priority_due_date")
         col_data_priority = find_col_index(headers, "data_priority")
         col_flag = find_col_index(headers, "flag_to_innova")
+        col_data_automated = find_col_index(headers, "data_automated")
         if col_period is None or col_hotel is None:
             continue
         for row in values[1:]:
             if len(row) <= col_period:
                 continue
             if parse_billing_period(row[col_period]) == target_month_key:
-                return title, headers, col_period, col_hotel, col_due, col_data_priority, col_flag
+                return title, headers, col_period, col_hotel, col_due, col_data_priority, col_flag, col_data_automated
     return None
 
 
@@ -302,7 +310,7 @@ def find_section_gid(sections, name):
     )
 
 
-def create_standalone_task(hotel_name, month_key, section_gid, due_at=None):
+def create_standalone_task(hotel_name, month_key, section_gid, due_at=None, data_automated=False):
     """Creates a hotel as a standalone TOP-LEVEL task directly in the
     given section - no parent, no batch container, no subtask nesting
     at all. Replaces the earlier batch-parent-with-subtasks and
@@ -316,7 +324,13 @@ def create_standalone_task(hotel_name, month_key, section_gid, due_at=None):
     batch a cohort belongs to, still governing the 25-cap, the never-
     split-same-due-date rule, and the staggered due-date chaining - with
     NO corresponding object in Asana at all. due_at (when given) is
-    stamped directly onto this individual hotel task."""
+    stamped directly onto this individual hotel task.
+
+    data_automated mirrors the sheet's "Data Automated" checkbox onto
+    the single-select workaround field - selecting its one option when
+    True, leaving the field genuinely unset (not the field key omitted
+    from the payload for readability, but no value assigned) when False,
+    matching the sheet's own checked/unchecked semantics."""
     payload = {
         "data": {
             "name": hotel_name,
@@ -327,6 +341,8 @@ def create_standalone_task(hotel_name, month_key, section_gid, due_at=None):
     }
     if due_at:
         payload["data"]["due_at"] = due_at
+    if data_automated:
+        payload["data"]["custom_fields"] = {DATA_AUTOMATED_FIELD_GID: DATA_AUTOMATED_YES_OPTION_GID}
     data = asana_request("POST", "/tasks", json=payload, params={"opt_fields": "due_at,due_on,name"})
     return data["gid"]
 
@@ -562,7 +578,7 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         print(f"No worksheet found with rows matching {target_month}.")
         return
 
-    sheet_title, headers, col_period, col_hotel, col_due, col_data_priority, col_flag = found
+    sheet_title, headers, col_period, col_hotel, col_due, col_data_priority, col_flag, col_data_automated = found
     data_rows = values_by_title[sheet_title][1:]
     print(f"Using worksheet '{sheet_title}' for {target_month}, {len(data_rows)} rows.")
     if col_flag is None:
@@ -576,6 +592,9 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
     if col_data_priority is None:
         print("WARNING: 'Data Priority' column was NOT found on this worksheet - "
               "no rows will be routed as standalone priority tasks.")
+    if col_data_automated is None:
+        print("WARNING: 'Data Automated' column was NOT found on this worksheet - "
+              "the Data Automated field will not be set on any task this run.")
 
     if not dry_run:
         sections = get_asana_sections()
@@ -591,8 +610,8 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
     #    batch (accumulates until the 3pm ET rollover - see Pass 2a).
     #  - everything else -> grouped by due_day_group for nested batching,
     #    exactly as originally designed.
-    priority_flag_hotels = []
-    groups = {}  # due_day_group -> list of hotel_name
+    priority_flag_hotels = []  # list of (hotel_name, data_automated)
+    groups = {}  # due_day_group -> list of (hotel_name, data_automated)
     for row in data_rows:
         if len(row) <= max(col_period, col_hotel, col_flag):
             continue
@@ -607,11 +626,15 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         if already_actioned(dedup_key):  # read-only either way, safe in dry-run
             continue
 
+        data_automated_value = (
+            is_truthy(row[col_data_automated]) if (col_data_automated is not None and len(row) > col_data_automated) else False
+        )
+
         data_priority_value = (
             row[col_data_priority].strip() if (col_data_priority is not None and len(row) > col_data_priority) else ""
         )
         if data_priority_value.lower() == "yes":
-            priority_flag_hotels.append(hotel_name)
+            priority_flag_hotels.append((hotel_name, data_automated_value))
             continue
 
         due_value = row[col_due].strip() if (col_due is not None and len(row) > col_due) else ""
@@ -622,7 +645,7 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         else:
             due_day_group = str(due_day) if due_day is not None else "blank"
 
-        groups.setdefault(due_day_group, []).append(hotel_name)
+        groups.setdefault(due_day_group, []).append((hotel_name, data_automated_value))
 
     if not priority_flag_hotels and not groups:
         print("No new flagged rows to action.")
@@ -639,14 +662,17 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
     # parent) is being addressed separately, as its own follow-up.
     if priority_flag_hotels:
         if dry_run:
+            names_only = [h for h, _ in priority_flag_hotels]
             print(f"[DRY RUN] Would create {len(priority_flag_hotels)} standalone task(s) "
-                  f"in Priority: {priority_flag_hotels}")
+                  f"in Priority: {names_only}")
         else:
-            for hotel_name in priority_flag_hotels:
+            for hotel_name, data_automated_value in priority_flag_hotels:
                 dedup_key = f"{target_month}:{hotel_name}"
-                task_gid = create_standalone_task(hotel_name, target_month, priority_section_gid)
+                task_gid = create_standalone_task(hotel_name, target_month, priority_section_gid,
+                                                   data_automated=data_automated_value)
                 record_actioned(dedup_key, target_month, hotel_name, task_gid, due_day_group="data_priority_flag")
-                print(f"Data Priority=Yes -> standalone task {task_gid} for '{hotel_name}'")
+                print(f"Data Priority=Yes -> standalone task {task_gid} for '{hotel_name}' "
+                      f"(Data Automated={data_automated_value})")
 
     # Pass 2b: everything else - each hotel becomes its own standalone
     # top-level task too, with due_at stamped directly on it. 'Batch' is
@@ -684,17 +710,19 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
                 else:
                     due_note = "(no due date - Priority has its own native-rule SLA)"
             print(f"[DRY RUN] Group '{due_day_group}' -> section '{section_label}', {action} {due_note}, "
-                  f"would create {count_needed} standalone task(s): {hotel_names}")
+                  f"would create {count_needed} standalone task(s): {[h for h, _ in hotel_names]}")
             continue
 
         due_at = get_or_create_batch_due_at(
             target_month, due_day_group, len(hotel_names), apply_staggered_due_date=apply_staggered_due_date
         )
-        for hotel_name in hotel_names:
+        for hotel_name, data_automated_value in hotel_names:
             dedup_key = f"{target_month}:{hotel_name}"
-            task_gid = create_standalone_task(hotel_name, target_month, target_section_gid, due_at=due_at)
+            task_gid = create_standalone_task(hotel_name, target_month, target_section_gid, due_at=due_at,
+                                               data_automated=data_automated_value)
             record_actioned(dedup_key, target_month, hotel_name, task_gid, due_day_group)
-            print(f"Group '{due_day_group}' -> standalone task {task_gid} (due_at={due_at}) for '{hotel_name}'")
+            print(f"Group '{due_day_group}' -> standalone task {task_gid} (due_at={due_at}) for '{hotel_name}' "
+                  f"(Data Automated={data_automated_value})")
 
 
 if __name__ == "__main__":
