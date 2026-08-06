@@ -37,6 +37,7 @@ OPT_FIELDS = "name,completed,completed_at,memberships.section.name"
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_DM_USER_ID = "U0BBU2YRQ72"  # Pia
+LIST_COMPLETED = False  # set via --list-completed, one-time use only
 
 
 def asana_headers():
@@ -172,12 +173,14 @@ def main():
     print(f"Total items (top-level + subtasks): {len(all_items_for_completion)}")
 
     completed_this_week = 0
+    completed_names = []
     for item in all_items_for_completion:
         if not item.get("completed") or not item.get("completed_at"):
             continue
         completed_date = dt.date.fromisoformat(item["completed_at"][:10])
         if completed_date >= week_start:
             completed_this_week += 1
+            completed_names.append(item["name"])
 
     print(f"Completed since {week_start.isoformat()}: {completed_this_week}")
     print(f"In progress by section (excl. {EXCLUDED_SECTION}): {in_progress_by_section}")
@@ -185,6 +188,13 @@ def main():
     lines = [
         "*Data Processing Requests - weekly digest*",
         f"Week of {week_start.strftime('%b %-d')}: *{completed_this_week}* task(s) completed so far.",
+    ]
+    if LIST_COMPLETED and completed_names:
+        lines.append("")
+        lines.append("*Completed this week:*")
+        for name in sorted(completed_names):
+            lines.append(f"  - {name}")
+    lines += [
         "",
         f"*In progress by section* (excludes {EXCLUDED_SECTION}):",
     ]
@@ -199,4 +209,10 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--list-completed", action="store_true",
+                         help="One-time use: include actual hotel/task names completed this week in the Slack message.")
+    args = parser.parse_args()
+    LIST_COMPLETED = args.list_completed
     main()
