@@ -5,7 +5,13 @@ on:
     # 12:00 UTC daily. Own lean, single-purpose job, separate from the
     # main billing pipeline's schedule.
     - cron: "0 12 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      list_completed:
+        description: 'One-time: include hotel/task names completed this week in the Slack message'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   digest:
@@ -24,4 +30,9 @@ jobs:
         env:
           ASANA_PAT: ${{ secrets.ASANA_PAT }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-        run: python weekly_completions_digest.py
+        run: |
+          if [ "${{ github.event.inputs.list_completed }}" = "true" ]; then
+            python weekly_completions_digest.py --list-completed
+          else
+            python weekly_completions_digest.py
+          fi
