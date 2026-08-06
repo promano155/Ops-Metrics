@@ -1,24 +1,23 @@
 """
 decouple_moved_subtasks.py
 
-Detaches ALL subtasks from their parents throughout the project, to
-match the new no-parent, fully-standalone task design going forward -
-NOT limited to just section-mismatched ones anymore. This includes old,
-already-completed batches from months ago (Nov 2025, etc.) - age and
-completion status don't matter.
+Detaches subtasks from their parents to match the new no-parent, fully-
+standalone task design going forward - scoped to ACTIVE parents only.
 
-The ONE exception: anything whose PARENT lives in the "Backlog" section
-is left completely alone, batched exactly as it is - maintained
-manually going forward, by choice.
+Two exclusions, both deliberate:
+- Parent's section is "Backlog" - maintained manually going forward, by
+  choice, left batched exactly as it is.
+- Parent is marked completed/archived - narrowed to this after seeing
+  the full unrestricted preview: decoupling months of old, already-
+  closed batches (Nov 2025, etc.) produced a wall of noise with no real
+  benefit, since nothing's actively being worked on those anymore.
 
-Originally built narrower (only subtasks whose own section no longer
-matched their parent's, from an assignee-triggered rule moving them
-elsewhere) - broadened to a full architectural cleanup once the main
-sync script itself was rewritten to never create parent/subtask
-structures again. Same root mechanism either way: a rule-driven "move"
-changes a task's own section membership but never touches a pre-
-existing parent relationship, so old nested structures don't self-heal
-on their own.
+Originally built even narrower (only subtasks whose own section no
+longer matched their parent's, from an assignee-triggered rule moving
+them elsewhere), then briefly broadened to everything before narrowing
+back here. Same root mechanism throughout: a rule-driven "move" changes
+a task's own section membership but never touches a pre-existing parent
+relationship, so old nested structures don't self-heal on their own.
 
 AUTO_DECOUPLE repo variable ("true"/"false", default false/preview-only)
 controls the SCHEDULED daily run. A manual dispatch can override this
@@ -36,7 +35,7 @@ import requests
 ASANA_TOKEN = os.environ["ASANA_PAT"]
 PROJECT_GID = "1207448572741662"  # Data Processing Requests
 BACKLOG_SECTION_NAME = "Backlog"
-OPT_FIELDS = "name,memberships.section.name,permalink_url"
+OPT_FIELDS = "name,completed,memberships.section.name,permalink_url"
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_DM_USER_ID = "U0BBU2YRQ72"  # Pia
@@ -145,14 +144,15 @@ def main():
         subtasks = fetch_subtasks(task["gid"])
         if subtasks:
             parent_section = get_section_name(task)
-            if parent_section == BACKLOG_SECTION_NAME:
-                # Deliberately left batched - maintained manually.
+            if parent_section == BACKLOG_SECTION_NAME or task.get("completed"):
+                # Backlog: maintained manually, left batched on purpose.
+                # Completed/archived parent: narrowing scope after
+                # seeing the full preview - decoupling months of old,
+                # already-closed batches produced too much noise to be
+                # useful. Only active (non-completed, non-Backlog)
+                # parents get decoupled now.
                 continue
             for sub in subtasks:
-                # Decouple EVERYTHING nested under a non-Backlog parent
-                # now, not just section-mismatched ones - full cleanup to
-                # match the new no-parent design everywhere going
-                # forward, regardless of parent age/completion status.
                 to_decouple.append((sub, task["name"], parent_section, get_section_name(sub)))
         if (i + 1) % 20 == 0:
             print(f"  ...processed {i + 1}/{len(top_level)} parents")
@@ -161,7 +161,7 @@ def main():
     today = dt.date.today().isoformat()
     if not to_decouple:
         send_slack_dm(f"*Decouple check - {today}*\nNothing to decouple - no subtasks remain nested under "
-                       f"a non-Backlog parent. :white_check_mark:")
+                       f"an active, non-Backlog parent. :white_check_mark:")
         print("Nothing to decouple.")
         return
 
