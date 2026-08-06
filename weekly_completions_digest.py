@@ -142,16 +142,21 @@ def main():
 
         parent_section_name = get_section_name(task)
         if subtasks:
-            # A subtask can be independently multi-homed into its OWN
-            # section (e.g. "Transferred to Integrations"), separate
-            # from its parent batch - that direct membership wins over
-            # the parent's section whenever it's present.
+            # If the PARENT batch itself is marked complete, treat every
+            # subtask as resolved for in-progress purposes - regardless
+            # of whether each individual hotel's own checkbox was ever
+            # ticked. Confirmed real: old batches (May/April/March/Nov/
+            # Dec) marked completed=true at the container level, sitting
+            # right in Priority/48hr SLA, with dozens of subtasks never
+            # individually checked off - that alone was inflating "in
+            # progress" counts with months-old, already-closed work.
+            parent_is_done = task.get("completed", False)
             for sub in subtasks:
                 sub_is_new = register(sub)
                 sub_section_name = get_section_name(sub) or parent_section_name
                 if sub_section_name == EXCLUDED_SECTION:
                     continue
-                if sub_is_new and not sub.get("completed"):
+                if sub_is_new and not parent_is_done and not sub.get("completed"):
                     in_progress_by_section[sub_section_name] = in_progress_by_section.get(sub_section_name, 0) + 1
         else:
             # No subtasks (a standalone item, e.g. Email Contact) - the
