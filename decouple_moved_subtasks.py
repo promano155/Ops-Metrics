@@ -1,33 +1,30 @@
 """
 decouple_moved_subtasks.py
 
-Detects hotel subtasks that have been auto-moved into a different
-section (e.g. via an Asana rule that changes section based on assignee)
-but are still nested under their ORIGINAL batch parent - same root
-mechanism confirmed while debugging weekly_completions_digest.py: a
-rule-driven "move" gives a subtask its own direct section membership,
-but never touches the pre-existing parent-child relationship, so the
-hotel keeps showing up under its old Priority/48hr-SLA parent even
-though it also correctly appears in its new section.
+Detaches ALL subtasks from their parents throughout the project, to
+match the new no-parent, fully-standalone task design going forward -
+NOT limited to just section-mismatched ones anymore. This includes old,
+already-completed batches from months ago (Nov 2025, etc.) - age and
+completion status don't matter.
 
-"Decoupling" = detaching the subtask from its parent entirely
-(setParent -> null), so it becomes a standalone top-level task living
-cleanly in its new section, with no more confusing residual nesting
-under the old batch.
+The ONE exception: anything whose PARENT lives in the "Backlog" section
+is left completely alone, batched exactly as it is - maintained
+manually going forward, by choice.
 
-Detection rule: a subtask needs decoupling if it has its OWN direct
-section membership that's DIFFERENT from its parent's section. If it
-has no direct section of its own (still purely inheriting via the
-parent), it's left alone - that's the normal, correct case.
-
-Same daily job handles both the initial backlog AND ongoing hygiene
-going forward - there's nothing different about a "first run" vs any
-later run, each one just catches whatever currently qualifies.
+Originally built narrower (only subtasks whose own section no longer
+matched their parent's, from an assignee-triggered rule moving them
+elsewhere) - broadened to a full architectural cleanup once the main
+sync script itself was rewritten to never create parent/subtask
+structures again. Same root mechanism either way: a rule-driven "move"
+changes a task's own section membership but never touches a pre-
+existing parent relationship, so old nested structures don't self-heal
+on their own.
 
 AUTO_DECOUPLE repo variable ("true"/"false", default false/preview-only)
-controls whether this actually detaches tasks or just reports what it
-would do - same rollout pattern as AUTO_DEDUPE on the duplicate digest.
-Always sends a Slack DM summary, whichever mode it's running in.
+controls the SCHEDULED daily run. A manual dispatch can override this
+for a one-off real run via the run_for_real input, regardless of what
+the repo variable is currently set to. Always sends a Slack DM summary,
+whichever mode it's running in.
 """
 
 import os
@@ -38,6 +35,7 @@ import requests
 
 ASANA_TOKEN = os.environ["ASANA_PAT"]
 PROJECT_GID = "1207448572741662"  # Data Processing Requests
+BACKLOG_SECTION_NAME = "Backlog"
 OPT_FIELDS = "name,memberships.section.name,permalink_url"
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
@@ -147,18 +145,23 @@ def main():
         subtasks = fetch_subtasks(task["gid"])
         if subtasks:
             parent_section = get_section_name(task)
+            if parent_section == BACKLOG_SECTION_NAME:
+                # Deliberately left batched - maintained manually.
+                continue
             for sub in subtasks:
-                sub_section = get_section_name(sub)
-                if sub_section and sub_section != parent_section:
-                    to_decouple.append((sub, task["name"], parent_section, sub_section))
+                # Decouple EVERYTHING nested under a non-Backlog parent
+                # now, not just section-mismatched ones - full cleanup to
+                # match the new no-parent design everywhere going
+                # forward, regardless of parent age/completion status.
+                to_decouple.append((sub, task["name"], parent_section, get_section_name(sub)))
         if (i + 1) % 20 == 0:
             print(f"  ...processed {i + 1}/{len(top_level)} parents")
         time.sleep(0.15)
 
     today = dt.date.today().isoformat()
     if not to_decouple:
-        send_slack_dm(f"*Decouple check - {today}*\nNothing to decouple - every subtask's section still "
-                       f"matches its parent's. :white_check_mark:")
+        send_slack_dm(f"*Decouple check - {today}*\nNothing to decouple - no subtasks remain nested under "
+                       f"a non-Backlog parent. :white_check_mark:")
         print("Nothing to decouple.")
         return
 
