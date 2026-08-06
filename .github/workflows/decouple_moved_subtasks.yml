@@ -1,0 +1,27 @@
+name: Decouple moved subtasks
+
+on:
+  schedule:
+    # 12:00 UTC daily. Own lean, single-purpose job.
+    - cron: "0 12 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  decouple:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run decouple check
+        env:
+          ASANA_PAT: ${{ secrets.ASANA_PAT }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          AUTO_DECOUPLE: ${{ vars.AUTO_DECOUPLE }}
+        run: python decouple_moved_subtasks.py
