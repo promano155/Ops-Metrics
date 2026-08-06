@@ -1,11 +1,18 @@
 """
 weekly_completions_digest.py
 
-Daily Slack DM reporting a running week-to-date count of completed
-tasks in Data Processing Requests - both top-level tasks (batch/summary
-parents, genuine one-offs) and subtasks (individual hotels), since the
-individual hotel subtasks are where most of the real completed work
-actually happens.
+Daily Slack DM reporting:
+1. A running week-to-date count of completed tasks in Data Processing
+   Requests - both top-level tasks (batch/summary parents, genuine
+   one-offs) and subtasks (individual hotels), since the individual
+   hotel subtasks are where most of the real completed work happens.
+2. A count of currently in-progress items per section, EXCLUDING
+   Backlog. "In progress" = not completed. If a top-level task has
+   subtasks, only its incomplete SUBTASKS count (the parent itself is
+   just a container, not a unit of work) - if it has no subtasks, the
+   top-level task itself counts if incomplete. Real project sections as
+   of writing: Priority (Within 24hrs), 48 hr SLA, Email Contact,
+   Transferred to Integrations, Complete, Backlog (excluded).
 
 "Completed" here means Asana's own native completion checkbox
 (completed / completed_at) - this project doesn't use a Done-section
@@ -25,7 +32,8 @@ import requests
 
 ASANA_TOKEN = os.environ["ASANA_PAT"]
 PROJECT_GID = "1207448572741662"  # Data Processing Requests
-OPT_FIELDS = "name,completed,completed_at"
+EXCLUDED_SECTION = "Backlog"
+OPT_FIELDS = "name,completed,completed_at,memberships.section.name"
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_DM_USER_ID = "U0BBU2YRQ72"  # Pia
@@ -79,6 +87,14 @@ def fetch_subtasks(parent_gid):
     return subtasks
 
 
+def get_section_name(task):
+    for m in task.get("memberships", []):
+        section = m.get("section")
+        if section:
+            return section.get("name")
+    return None
+
+
 def send_slack_dm(text):
     resp = requests.post(
         "https://slack.com/api/chat.postMessage",
@@ -100,17 +116,42 @@ def main():
     top_level = fetch_top_level_tasks()
     print(f"Found {len(top_level)} top-level tasks. Fetching subtasks for each...")
 
-    all_items = list(top_level)
+    all_items_for_completion = list(top_level)
+    in_progress_by_section = {}
+
     for i, task in enumerate(top_level):
-        all_items.extend(fetch_subtasks(task["gid"]))
+        subtasks = fetch_subtasks(task["gid"])
+        all_items_for_completion.extend(subtasks)  # unaffected by the Backlog exclusion below
+
+        parent_section_name = get_section_name(task)
+        if subtasks:
+            # A subtask can be independently multi-homed into its OWN
+            # section (e.g. "Transferred to Integrations"), separate
+            # from its parent batch - that direct membership wins over
+            # the parent's section whenever it's present. Confirmed real:
+            # hotels showing as still-subtasks of "July Batch 1" while
+            # ALSO sitting directly in Transferred to Integrations.
+            for sub in subtasks:
+                sub_section_name = get_section_name(sub) or parent_section_name
+                if sub_section_name == EXCLUDED_SECTION:
+                    continue
+                if not sub.get("completed"):
+                    in_progress_by_section[sub_section_name] = in_progress_by_section.get(sub_section_name, 0) + 1
+        else:
+            # No subtasks (a standalone item, e.g. Email Contact) - the
+            # task itself is the unit of work.
+            if parent_section_name != EXCLUDED_SECTION and not task.get("completed"):
+                in_progress_by_section[parent_section_name] = in_progress_by_section.get(parent_section_name, 0) + 1
+
         if (i + 1) % 20 == 0:
-            print(f"  ...processed {i + 1}/{len(top_level)} parents, {len(all_items)} items so far")
+            print(f"  ...processed {i + 1}/{len(top_level)} parents, "
+                  f"{len(all_items_for_completion)} items so far")
         time.sleep(0.15)
 
-    print(f"Total items (top-level + subtasks): {len(all_items)}")
+    print(f"Total items (top-level + subtasks): {len(all_items_for_completion)}")
 
     completed_this_week = 0
-    for item in all_items:
+    for item in all_items_for_completion:
         if not item.get("completed") or not item.get("completed_at"):
             continue
         completed_date = dt.date.fromisoformat(item["completed_at"][:10])
@@ -118,12 +159,21 @@ def main():
             completed_this_week += 1
 
     print(f"Completed since {week_start.isoformat()}: {completed_this_week}")
+    print(f"In progress by section (excl. {EXCLUDED_SECTION}): {in_progress_by_section}")
 
-    message = (
-        f"*Data Processing Requests - completions this week*\n"
-        f"Week of {week_start.strftime('%b %-d')}: *{completed_this_week}* task(s) completed so far."
-    )
-    send_slack_dm(message)
+    lines = [
+        "*Data Processing Requests - weekly digest*",
+        f"Week of {week_start.strftime('%b %-d')}: *{completed_this_week}* task(s) completed so far.",
+        "",
+        f"*In progress by section* (excludes {EXCLUDED_SECTION}):",
+    ]
+    if not in_progress_by_section:
+        lines.append("  Nothing in progress outside Backlog.")
+    else:
+        for section, count in sorted(in_progress_by_section.items(), key=lambda kv: -kv[1]):
+            lines.append(f"  {section or '(no section)'}: *{count}*")
+
+    send_slack_dm("\n".join(lines))
     print("Digest sent.")
 
 
