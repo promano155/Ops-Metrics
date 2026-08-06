@@ -116,31 +116,47 @@ def main():
     top_level = fetch_top_level_tasks()
     print(f"Found {len(top_level)} top-level tasks. Fetching subtasks for each...")
 
-    all_items_for_completion = list(top_level)
+    # Some tasks are MULTI-HOMED: a subtask of its batch parent AND
+    # independently a direct member of the project itself (that's what
+    # having its own section membership requires). Without dedup, such
+    # a task gets fetched and counted TWICE - once via fetch_top_level_tasks
+    # directly, once again via fetch_subtasks() on its parent. Confirmed
+    # real via direct comparison: Asana showed 4 real tasks in Transferred
+    # to Integrations, the undeduped script reported exactly 8 - a clean
+    # 2x, not a rounding error. seen_gids ensures each task is only ever
+    # counted once, regardless of which path encounters it first.
+    seen_gids = set()
+    all_items_for_completion = []
     in_progress_by_section = {}
 
+    def register(item):
+        if item["gid"] in seen_gids:
+            return False
+        seen_gids.add(item["gid"])
+        all_items_for_completion.append(item)
+        return True
+
     for i, task in enumerate(top_level):
+        is_new_task = register(task)
         subtasks = fetch_subtasks(task["gid"])
-        all_items_for_completion.extend(subtasks)  # unaffected by the Backlog exclusion below
 
         parent_section_name = get_section_name(task)
         if subtasks:
             # A subtask can be independently multi-homed into its OWN
             # section (e.g. "Transferred to Integrations"), separate
             # from its parent batch - that direct membership wins over
-            # the parent's section whenever it's present. Confirmed real:
-            # hotels showing as still-subtasks of "July Batch 1" while
-            # ALSO sitting directly in Transferred to Integrations.
+            # the parent's section whenever it's present.
             for sub in subtasks:
+                sub_is_new = register(sub)
                 sub_section_name = get_section_name(sub) or parent_section_name
                 if sub_section_name == EXCLUDED_SECTION:
                     continue
-                if not sub.get("completed"):
+                if sub_is_new and not sub.get("completed"):
                     in_progress_by_section[sub_section_name] = in_progress_by_section.get(sub_section_name, 0) + 1
         else:
             # No subtasks (a standalone item, e.g. Email Contact) - the
             # task itself is the unit of work.
-            if parent_section_name != EXCLUDED_SECTION and not task.get("completed"):
+            if is_new_task and parent_section_name != EXCLUDED_SECTION and not task.get("completed"):
                 in_progress_by_section[parent_section_name] = in_progress_by_section.get(parent_section_name, 0) + 1
 
         if (i + 1) % 20 == 0:
