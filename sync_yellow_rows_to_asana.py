@@ -3,12 +3,24 @@ sync_yellow_rows_to_asana.py
 
 Scans the CURRENT month's billing tab only (not historical tabs) for
 rows checked in the "Flag to Innova" column. Unchecked/blank = no
-action. Checked rows become a subtask of the appropriate batch, which
-lives inside one of two existing sections:
+action. Checked rows become a standalone TOP-LEVEL task directly in
+one of two existing sections - NO parent, no subtask nesting at all:
 
 - "Priority (Within 24hrs)" - due today or already passed.
 - "48 hr SLA"                - everything else, regardless of how far out.
   (There is no third, lower-urgency destination - confirmed.)
+
+--- Why standalone tasks, not batch-parent-with-subtasks ---
+This used to nest hotels as subtasks under a shared batch/summary
+parent (to consolidate notifications). That caused real, confirmed
+confusion: an assignee-triggered Asana rule that moves a hotel to a
+different section (e.g. Email Contact) changes that hotel's OWN section
+membership, but never touches its pre-existing parent relationship - so
+the hotel kept showing up under its old parent too, even though it also
+correctly appeared in its new section. Every hotel is now a standalone
+task from creation, so there's no parent for it to get stuck under.
+Notification volume (the original reason for nesting) is being
+addressed separately, as its own follow-up - not by nesting tasks.
 
 --- How "current month" is determined ---
 NOT a fixed calendar formula. This scans every tab, finds every Billing
@@ -21,25 +33,23 @@ behind schedule, but reading the sheet's own content always can.
 --month overrides this entirely, for testing against a specific past
 month regardless of what's most recent.
 
-Structure inside each section: batches are PARENT TASKS named
-"{Month} Batch {N}" (e.g. "July Batch 1"), grouped by Priority Due Date
-first (rows due the same day-of-month stay together; overdue rows all
-share the group "overdue"), capped at 25 subtasks per batch. Individual
-hotels are created as SUBTASKS of that batch task, not as their own
-top-level project tasks. Batches accumulate across days within the same
-month - a batch only gets a new parent task once it's full.
+--- "Batch" is now pure Supabase bookkeeping, not an Asana object ---
+Rows are still grouped by Priority Due Date first (rows due the same
+day-of-month stay together; overdue rows share the group "overdue"),
+still capped at 25 hotels per numbered batch, and same-due-date cohorts
+still never split across two batch numbers, even partially - all of
+that logic is unchanged. What changed is the ACTION taken once a cohort
+is assigned to a batch number: instead of creating an Asana parent task
+to hold it, the batch's due_at (for 48hr SLA - staggered, chained, see
+get_next_standard_batch_due_at) is stamped directly onto each individual
+hotel task. There is no Asana task anywhere representing "a batch" -
+only Supabase's asana_batch_sections table knows batch numbers exist.
 
-Same-due-date rows are never split across two batches, even partially:
-each run's new arrivals for a given due date are placed as one cohort -
-either all of them fit in the currently open batch for that due date, or
-none do and a brand new batch is opened for the whole cohort. This can
-leave a batch permanently short of 25 (e.g. stuck at 24) - that's
-intentional, not a bug.
-
-The actual due date value is NEVER written into any Asana-visible field
-(task name, subtask name, or notes) - it's used only for internal
-routing and logged to Supabase. All the third party sees is which
-section/batch a hotel's subtask lands in.
+The actual due date value from the SHEET is still never written into
+any Asana-visible field (task name or notes) - it's used only for
+internal routing/batch-assignment and logged to Supabase. The due_at
+that DOES appear on a task is the computed SLA deadline, not the raw
+sheet value.
 
 --- Why a checkbox instead of cell color ---
 This used to detect flagged rows by background color (yellow vs green).
@@ -57,13 +67,8 @@ the script no longer looks at color at all.
 - "Due today" counts as overdue -> routes to Priority (Within 24hrs).
 - Everything else -> "48 hr SLA", regardless of how far away the due
   date is. No third tier.
-- This script does not set any due date or SLA field on Priority tasks
-  - an existing Asana rule on that section handles the SLA.
-- Note for later: if you ever want to programmatically check subtask
-  completion status for reporting, Asana's nested subtask fields are
-  unreliable via include_subtasks - each subtask needs its own get_task
-  call. Not a concern for this script (it only creates), just flagging
-  it as a known constraint if this gets extended.
+- This script does not set any due date on Priority tasks - an existing
+  Asana rule on that section handles the SLA natively.
 """
 
 import os
@@ -72,7 +77,6 @@ import json
 import time
 import calendar
 import datetime as dt
-from zoneinfo import ZoneInfo
 
 import requests
 from google.oauth2.service_account import Credentials
@@ -96,13 +100,6 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 DEDUP_TABLE = "yellow_row_asana_tasks"
 BATCH_TABLE = "asana_batch_sections"
 STANDARD_BATCH_SEQUENCE_TABLE = "standard_sla_batch_sequence"
-PRIORITY_BATCH_TABLE = "priority_summary_batches"
-
-EASTERN = ZoneInfo("America/New_York")
-PRIORITY_CUTOFF_HOUR = 15  # 3pm ET - accumulate into the same priority
-                           # batch until this hour, then roll over to a
-                           # fresh one (with its own fresh 24h SLA, via
-                           # the existing native rule on that section)
 
 TRUE_VALUES = {"true", "yes", "y", "1", "checked"}
 
@@ -122,11 +119,6 @@ COLUMN_ALIASES = {
 def get_credentials():
     creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     return Credentials.from_service_account_info(creds_dict, scopes=SHEETS_SCOPES)
-
-
-def month_name_for(month_key):
-    year, month = (int(x) for x in month_key.split("-"))
-    return calendar.month_name[month]
 
 
 def parse_utc_datetime(value):
@@ -310,95 +302,33 @@ def find_section_gid(sections, name):
     )
 
 
-def create_batch_task(name, section_gid, due_at=None):
-    """Creates the parent 'batch' task and places it in the given section."""
+def create_standalone_task(hotel_name, month_key, section_gid, due_at=None):
+    """Creates a hotel as a standalone TOP-LEVEL task directly in the
+    given section - no parent, no batch container, no subtask nesting
+    at all. Replaces the earlier batch-parent-with-subtasks and
+    priority-summary-with-subtasks designs, both retired because nesting
+    caused real, confirmed confusion: hotels moved to a different
+    section by an assignee-triggered rule kept visually showing up under
+    their old parent too, since the rule changes a task's own section
+    membership but never touches its pre-existing parent relationship.
+
+    'Batch' is now purely a Supabase bookkeeping concept - which numbered
+    batch a cohort belongs to, still governing the 25-cap, the never-
+    split-same-due-date rule, and the staggered due-date chaining - with
+    NO corresponding object in Asana at all. due_at (when given) is
+    stamped directly onto this individual hotel task."""
     payload = {
         "data": {
-            "name": name,
+            "name": hotel_name,
+            "notes": f"Flagged via 'Flag to Innova' on the Curacity Billing Overview sheet for {month_key}.",
             "projects": [ASANA_PROJECT_GID],
             "memberships": [{"project": ASANA_PROJECT_GID, "section": section_gid}],
         }
     }
     if due_at:
         payload["data"]["due_at"] = due_at
-        print(f"Sending due_at to Asana for '{name}': {due_at!r}")
-    # opt_fields is required here - Asana's API returns only a minimal
-    # field set by default, so without this the echo-back check below
-    # would always show None regardless of what was actually stored.
     data = asana_request("POST", "/tasks", json=payload, params={"opt_fields": "due_at,due_on,name"})
-    if due_at:
-        print(f"Asana echoed back for '{name}': due_at={data.get('due_at')!r}, due_on={data.get('due_on')!r}")
     return data["gid"]
-
-
-def create_hotel_subtask(hotel_name, month_key, parent_task_gid):
-    """Creates the hotel-specific task as a SUBTASK of the batch task.
-    Inherits visibility from the parent - no project/section needed here."""
-    payload = {
-        "data": {
-            "name": hotel_name,
-            "notes": f"Flagged via 'Flag to Innova' on the Curacity Billing Overview sheet for {month_key}.",
-        }
-    }
-    data = asana_request("POST", f"/tasks/{parent_task_gid}/subtasks", json=payload)
-    return data["gid"]
-
-
-def priority_bucket_key(now_utc):
-    """Buckets 'now' into a half-day window in US Eastern time: midnight
-    to 2:59:59pm ET = 'AM', 3:00pm to 11:59:59pm ET = 'PM'. Uses
-    zoneinfo (not a fixed offset) so this is correct across the EST/EDT
-    changeover automatically, rather than drifting an hour twice a year."""
-    now_eastern = now_utc.replace(tzinfo=dt.timezone.utc).astimezone(EASTERN)
-    half = "AM" if now_eastern.hour < PRIORITY_CUTOFF_HOUR else "PM"
-    return f"{now_eastern.date().isoformat()}-{half}"
-
-
-def create_priority_summary_task(hotel_count, section_gid):
-    """Creates a brand new priority batch parent with the given count
-    baked into its title."""
-    label = f"{hotel_count} hotel{'s' if hotel_count != 1 else ''} added to Priority"
-    payload = {
-        "data": {
-            "name": label,
-            "projects": [ASANA_PROJECT_GID],
-            "memberships": [{"project": ASANA_PROJECT_GID, "section": section_gid}],
-        }
-    }
-    data = asana_request("POST", "/tasks", json=payload)
-    return data["gid"]
-
-
-def rename_task(task_gid, new_name):
-    asana_request("PUT", f"/tasks/{task_gid}", json={"data": {"name": new_name}})
-
-
-def get_or_create_priority_summary_task(bucket_key, additional_count, section_gid):
-    """Accumulates into the same priority batch for this half-day window
-    (renaming its title to reflect the running total each time more get
-    added), or creates a fresh one if this window hasn't started yet.
-    Each new window gets a brand new parent task, which means a brand
-    new 'task added to project' event - triggering a fresh 24h SLA via
-    the existing native rule on this section, exactly the rollover
-    behavior wanted at the 3pm cutoff.
-
-    IMPORTANT UNVERIFIED RISK (still applies to every hotel subtask
-    added here, confirmed separately as actually working): subtasks
-    reliably trigger this section's SLA-breach rule, confirmed in
-    testing - that's why this remains safe to keep using subtasks for
-    individual hotels regardless of how many times this parent gets
-    reused across a single window."""
-    state = get_priority_batch_state(bucket_key)
-    if state:
-        new_total = state["hotel_count"] + additional_count
-        new_label = f"{new_total} hotel{'s' if new_total != 1 else ''} added to Priority"
-        rename_task(state["summary_task_gid"], new_label)
-        upsert_priority_batch_state(bucket_key, state["summary_task_gid"], new_total)
-        return state["summary_task_gid"]
-    else:
-        summary_task_gid = create_priority_summary_task(additional_count, section_gid)
-        upsert_priority_batch_state(bucket_key, summary_task_gid, additional_count)
-        return summary_task_gid
 
 
 # ---------------------------------------------------------------------------
@@ -448,31 +378,6 @@ def record_actioned(dedup_key, month_key, hotel_name, subtask_gid, due_day_group
     resp.raise_for_status()
 
 
-def get_priority_batch_state(bucket_key):
-    url = f"{SUPABASE_URL}/rest/v1/{PRIORITY_BATCH_TABLE}"
-    params = {"bucket_key": f"eq.{bucket_key}", "select": "*"}
-    resp = requests.get(url, headers=supabase_headers(), params=params, timeout=30)
-    resp.raise_for_status()
-    rows = resp.json()
-    return rows[0] if rows else None
-
-
-def upsert_priority_batch_state(bucket_key, summary_task_gid, hotel_count):
-    payload = {
-        "bucket_key": bucket_key,
-        "summary_task_gid": summary_task_gid,
-        "hotel_count": hotel_count,
-        "updated_at": dt.datetime.utcnow().isoformat(),
-    }
-    resp = requests.post(
-        f"{SUPABASE_URL}/rest/v1/{PRIORITY_BATCH_TABLE}",
-        headers={**supabase_headers(), "Prefer": "resolution=merge-duplicates"},
-        json=payload,
-        timeout=30,
-    )
-    resp.raise_for_status()
-
-
 def get_batch_state(month_key, due_day_group):
     url = (
         f"{SUPABASE_URL}/rest/v1/{BATCH_TABLE}"
@@ -485,12 +390,16 @@ def get_batch_state(month_key, due_day_group):
     return rows[0] if rows else None
 
 
-def upsert_batch_state(month_key, due_day_group, batch_number, batch_task_gid, task_count, due_at=None):
+def upsert_batch_state(month_key, due_day_group, batch_number, task_count, due_at=None):
+    """Purely Supabase-side bookkeeping now - no batch_task_gid, since
+    there's no longer an Asana object representing a batch at all. Still
+    tracks exactly what it always did: how many hotels are in this
+    numbered batch, and what due_at applies to it (for staggering and
+    expiry-checking) - just nothing for a gid to point at anymore."""
     payload = {
         "month_key": month_key,
         "due_day_group": due_day_group,
         "batch_number": batch_number,
-        "batch_task_gid": batch_task_gid,
         "task_count": task_count,
         "updated_at": dt.datetime.utcnow().isoformat(),
     }
@@ -544,31 +453,33 @@ def get_next_standard_batch_due_at(month_key, dry_run=False):
     return next_due_at.replace(microsecond=0).isoformat() + "Z", next_sequence
 
 
-def get_or_create_batch_task_for_group(month_key, due_day_group, month_name, section_gid, count_needed,
-                                        apply_staggered_due_date=False):
-    """Places an entire same-due-date cohort (count_needed new subtasks
-    from this run) into one batch task - never split across two.
+def get_or_create_batch_due_at(month_key, due_day_group, count_needed, apply_staggered_due_date=False):
+    """Places an entire same-due-date cohort (count_needed new hotel
+    tasks from this run) into one numbered batch - never split across
+    two. Returns the due_at to stamp directly on each hotel task in this
+    cohort (or None for Priority, which has its own native-rule SLA).
+
+    'Batch' is PURE Supabase bookkeeping now - no Asana object at all.
+    Every rule that applied when batches were Asana parent tasks still
+    applies identically here, just without anything in Asana for it to
+    point at:
 
     If the currently open batch has enough remaining room for ALL of
-    count_needed, AND its due date (if any) hasn't already passed, they
-    all go there. If not, a brand new batch task is created for the
-    WHOLE cohort, even if that leaves the previous batch permanently
-    short of 25. Same-due-date rows are never split across two batches,
-    even partially.
+    count_needed, AND its due date (if any) hasn't already passed, this
+    cohort joins it (same due_at as whatever's already in that batch).
+    If not, a brand new batch number opens for the WHOLE cohort, even if
+    that leaves the previous batch permanently short of 25. Same-due-
+    date rows are never split across two batches, even partially.
 
     A batch whose due date has already passed is treated as CLOSED
-    regardless of how few subtasks it has. Due dates are set once, at
-    creation - a low-volume batch that takes days to fill would
-    otherwise let a hotel added on day 4 silently inherit a due date set
-    back on day 1, which could already be hours from expiring or already
-    past. Once expired, a fresh batch opens instead, with an honestly-
-    in-the-future due date.
+    regardless of how few hotels it has - a low-volume batch that takes
+    days to fill would otherwise let a hotel added on day 4 silently
+    inherit a due date set back on day 1, possibly already expired.
 
-    apply_staggered_due_date=True ONLY for 48hr SLA batches (never
-    Priority, which has its own native-rule SLA) - see
-    get_next_standard_batch_due_at for the 48h-then-chained-24h logic.
-    Reusing an existing batch never touches its due date - only set once,
-    at creation."""
+    apply_staggered_due_date=True ONLY for 48hr SLA (never Priority) -
+    see get_next_standard_batch_due_at for the 48h-then-chained-24h
+    logic. Reusing an existing batch never recomputes its due_at - only
+    set once, at that batch's creation."""
     state = get_batch_state(month_key, due_day_group)
 
     is_expired = False
@@ -580,8 +491,8 @@ def get_or_create_batch_task_for_group(month_key, due_day_group, month_name, sec
 
     if state and not is_expired and remaining >= count_needed:
         new_count = state["task_count"] + count_needed
-        upsert_batch_state(month_key, due_day_group, state["batch_number"], state["batch_task_gid"], new_count)
-        return state["batch_task_gid"]
+        upsert_batch_state(month_key, due_day_group, state["batch_number"], new_count, due_at=state.get("due_at"))
+        return state.get("due_at")
 
     if state and is_expired:
         print(f"Batch #{state['batch_number']} for '{due_day_group}' has an expired due date "
@@ -589,17 +500,17 @@ def get_or_create_batch_task_for_group(month_key, due_day_group, month_name, sec
               f"closing it and starting a fresh batch rather than silently inheriting a stale deadline.")
 
     next_batch_number = (state["batch_number"] + 1) if state else 1
-    batch_name = f"{month_name} Batch {next_batch_number}"
 
     due_at = None
     if apply_staggered_due_date:
         due_at, sequence_number = get_next_standard_batch_due_at(month_key)
-        print(f"Staggered due date for '{batch_name}': {due_at} (sequence #{sequence_number})")
+        print(f"Staggered due date for batch #{next_batch_number} ('{due_day_group}'): "
+              f"{due_at} (sequence #{sequence_number})")
 
-    batch_task_gid = create_batch_task(batch_name, section_gid, due_at=due_at)
-    upsert_batch_state(month_key, due_day_group, next_batch_number, batch_task_gid, count_needed, due_at=due_at)
-    print(f"Created new batch task '{batch_name}' for due-day group '{due_day_group}' ({count_needed} rows)")
-    return batch_task_gid
+    upsert_batch_state(month_key, due_day_group, next_batch_number, count_needed, due_at=due_at)
+    print(f"New batch #{next_batch_number} for due-day group '{due_day_group}' "
+          f"({count_needed} hotels, due_at={due_at})")
+    return due_at
 
 
 # ---------------------------------------------------------------------------
@@ -630,8 +541,6 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
             print("Could not find ANY parseable billing period across the whole sheet - nothing to do.")
             return
         print(f"No --month override given - detected most recent billing period in the sheet: {target_month}")
-
-    month_name = month_name_for(target_month)
 
     if as_of_day_override:
         today_day = as_of_day_override
@@ -719,37 +628,34 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         print("No new flagged rows to action.")
         return
 
-    # Pass 2a: Data Priority = Yes hotels - accumulate into ONE summary
-    # parent per half-day window (midnight-3pm ET, then 3pm-midnight ET),
-    # instead of a brand new one every single run. This means multiple
-    # runs during the same window land in the same batch with a single
-    # shared "task added to project" event (one notification, not a
-    # scattered one per run), while the window boundary at 3pm still
-    # rolls into a genuinely fresh parent - which triggers its own fresh
-    # 24h SLA via the existing native rule on this section.
+    # Pass 2a: Data Priority = Yes hotels - each one a standalone
+    # top-level task directly in Priority, no parent at all. Reverted
+    # from the earlier shared-summary-parent design after confirming
+    # real, ongoing confusion: an assignee-triggered rule moving a hotel
+    # to a different section (e.g. Email Contact) changes that hotel's
+    # own section membership but never touches its pre-existing parent
+    # relationship, so it kept showing up under its old Priority parent
+    # too. Notification volume (the original reason for the shared
+    # parent) is being addressed separately, as its own follow-up.
     if priority_flag_hotels:
-        bucket_key = priority_bucket_key(dt.datetime.utcnow())
         if dry_run:
-            state = get_priority_batch_state(bucket_key)  # read-only peek, safe in dry-run
-            existing_count = state["hotel_count"] if state else 0
-            action = "ADD to existing" if state else "CREATE NEW"
-            new_total = existing_count + len(priority_flag_hotels)
-            print(f"[DRY RUN] Would {action} priority batch for window '{bucket_key}' "
-                  f"(currently {existing_count} hotel(s)) -> new total {new_total}: {priority_flag_hotels}")
+            print(f"[DRY RUN] Would create {len(priority_flag_hotels)} standalone task(s) "
+                  f"in Priority: {priority_flag_hotels}")
         else:
-            summary_task_gid = get_or_create_priority_summary_task(
-                bucket_key, len(priority_flag_hotels), priority_section_gid
-            )
-            print(f"Priority window '{bucket_key}' -> summary task {summary_task_gid}")
             for hotel_name in priority_flag_hotels:
                 dedup_key = f"{target_month}:{hotel_name}"
-                subtask_gid = create_hotel_subtask(hotel_name, target_month, summary_task_gid)
-                record_actioned(dedup_key, target_month, hotel_name, subtask_gid, due_day_group="data_priority_flag")
-                print(f"Data Priority=Yes -> subtask {subtask_gid} under priority window "
-                      f"'{bucket_key}' for '{hotel_name}'")
+                task_gid = create_standalone_task(hotel_name, target_month, priority_section_gid)
+                record_actioned(dedup_key, target_month, hotel_name, task_gid, due_day_group="data_priority_flag")
+                print(f"Data Priority=Yes -> standalone task {task_gid} for '{hotel_name}'")
 
-    # Pass 2b: everything else - place each group's entire cohort into
-    # one nested batch task (or simulate doing so, in dry-run mode).
+    # Pass 2b: everything else - each hotel becomes its own standalone
+    # top-level task too, with due_at stamped directly on it. 'Batch' is
+    # now PURE Supabase bookkeeping (25-cap, no-split-same-due-date,
+    # staggered due-date chaining, expiry) - there is no Asana object
+    # representing a batch anymore, by the same reasoning as Priority
+    # above. Same-due-date cohorts still never split across two Supabase
+    # batch numbers, and every hotel in the same batch still gets the
+    # identical staggered due_at.
     for due_day_group, hotel_names in groups.items():
         section_label = "Priority (Within 24hrs)" if due_day_group == "overdue" else "48 hr SLA"
         target_section_gid = priority_section_gid if due_day_group == "overdue" else standard_section_gid
@@ -764,34 +670,31 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
             remaining = (BATCH_SIZE - state["task_count"]) if state else 0
             count_needed = len(hotel_names)
             if state and not is_expired and remaining >= count_needed:
-                batch_label = f"{month_name} Batch {state['batch_number']}"
-                action = f"REUSE existing batch (currently {state['task_count']}/{BATCH_SIZE}, room for {remaining})"
-                due_note = "(due date unchanged - only set at creation)"
+                action = f"REUSE batch #{state['batch_number']} (currently {state['task_count']}/{BATCH_SIZE}, room for {remaining})"
+                due_note = f"(due_at stays {state.get('due_at')})"
             else:
                 next_num = (state["batch_number"] + 1) if state else 1
-                batch_label = f"{month_name} Batch {next_num}"
                 if state and is_expired:
-                    action = f"CREATE NEW batch (previous one EXPIRED at {state['due_at']}, was only {state['task_count']}/{BATCH_SIZE} full)"
+                    action = f"NEW batch #{next_num} (previous EXPIRED at {state['due_at']}, was only {state['task_count']}/{BATCH_SIZE} full)"
                 else:
-                    action = "CREATE NEW batch" if state else "CREATE FIRST batch"
+                    action = f"NEW batch #{next_num}" if state else f"FIRST batch #{next_num}"
                 if apply_staggered_due_date:
                     projected_due_at, seq = get_next_standard_batch_due_at(target_month, dry_run=True)
                     due_note = f"(would set due_at={projected_due_at}, sequence #{seq})"
                 else:
                     due_note = "(no due date - Priority has its own native-rule SLA)"
-            print(f"[DRY RUN] Group '{due_day_group}' -> section '{section_label}', {action}: "
-                  f"'{batch_label}' {due_note}, would add {count_needed} subtask(s): {hotel_names}")
+            print(f"[DRY RUN] Group '{due_day_group}' -> section '{section_label}', {action} {due_note}, "
+                  f"would create {count_needed} standalone task(s): {hotel_names}")
             continue
 
-        batch_task_gid = get_or_create_batch_task_for_group(
-            target_month, due_day_group, month_name, target_section_gid, len(hotel_names),
-            apply_staggered_due_date=apply_staggered_due_date,
+        due_at = get_or_create_batch_due_at(
+            target_month, due_day_group, len(hotel_names), apply_staggered_due_date=apply_staggered_due_date
         )
         for hotel_name in hotel_names:
             dedup_key = f"{target_month}:{hotel_name}"
-            subtask_gid = create_hotel_subtask(hotel_name, target_month, batch_task_gid)
-            record_actioned(dedup_key, target_month, hotel_name, subtask_gid, due_day_group)
-            print(f"Group '{due_day_group}' -> subtask {subtask_gid} under batch {batch_task_gid} for '{hotel_name}'")
+            task_gid = create_standalone_task(hotel_name, target_month, target_section_gid, due_at=due_at)
+            record_actioned(dedup_key, target_month, hotel_name, task_gid, due_day_group)
+            print(f"Group '{due_day_group}' -> standalone task {task_gid} (due_at={due_at}) for '{hotel_name}'")
 
 
 if __name__ == "__main__":
