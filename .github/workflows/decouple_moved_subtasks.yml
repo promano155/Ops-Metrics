@@ -4,7 +4,13 @@ on:
   schedule:
     # 12:00 UTC daily. Own lean, single-purpose job.
     - cron: "0 12 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      run_for_real:
+        description: 'Force a REAL run right now (actually detach tasks), regardless of the AUTO_DECOUPLE repo variable'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   decouple:
@@ -23,5 +29,5 @@ jobs:
         env:
           ASANA_PAT: ${{ secrets.ASANA_PAT }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          AUTO_DECOUPLE: ${{ vars.AUTO_DECOUPLE }}
+          AUTO_DECOUPLE: ${{ (github.event.inputs.run_for_real == 'true') && 'true' || vars.AUTO_DECOUPLE }}
         run: python decouple_moved_subtasks.py
