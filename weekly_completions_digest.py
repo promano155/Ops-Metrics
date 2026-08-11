@@ -36,7 +36,7 @@ EXCLUDED_SECTION = "Backlog"
 OPT_FIELDS = "name,completed,completed_at,memberships.section.name"
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-SLACK_CHANNEL_ID = "C06C898CN4C"  # ops-team-only
+SLACK_DM_USER_ID = "U0BBU2YRQ72"  # Pia
 LIST_COMPLETED = False  # set via --list-completed, one-time use only
 
 
