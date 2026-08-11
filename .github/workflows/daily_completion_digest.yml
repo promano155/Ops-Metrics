@@ -1,21 +1,29 @@
-name: Weekly completions digest
+name: Daily completions digest
 
 on:
   schedule:
     # 12:00 UTC daily. Own lean, single-purpose job, separate from the
     # main billing pipeline's schedule.
     - cron: "0 12 * * *"
+
   workflow_dispatch:
     inputs:
       list_completed:
-        description: 'One-time: include hotel/task names completed this week in the Slack message'
+        description: "Include hotel/task names completed this week"
         required: false
         type: boolean
         default: false
 
+      dry_run:
+        description: "Dry run — build digest but DO NOT post to Slack"
+        required: false
+        type: boolean
+        default: true
+
 jobs:
   digest:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -26,13 +34,18 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run weekly completions digest
+      - name: Run Daily Completions Digest
         env:
           ASANA_PAT: ${{ secrets.ASANA_PAT }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+          # Manual runs use the Dry Run checkbox.
+          # Scheduled runs always use false so the normal daily digest posts.
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+
         run: |
-          if [ "${{ github.event.inputs.list_completed }}" = "true" ]; then
-            python weekly_completions_digest.py --list-completed
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.list_completed }}" = "true" ]; then
+            python daily_completions_digest.py --list-completed
           else
-            python weekly_completions_digest.py
+            python daily_completions_digest.py
           fi
