@@ -1,5 +1,4 @@
-name: Ops task tracker sync
-
+name: Javi friday digest
 on:
   schedule:
     # 12:00 UTC daily, weekdays only. Separate time from the EOD combined
