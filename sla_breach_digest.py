@@ -23,10 +23,16 @@ breakdown of everything outstanding by team already exists elsewhere,
 per the #ops-team-only breakdown bot - this is deliberately narrower.)
 
 Due date handling:
-- Uses due_at (full timestamp) when present - this is what
-  sync_yellow_rows_to_asana.py stamps on "48 hr SLA" tasks.
-- Falls back to due_on (date-only, midnight UTC) when due_at isn't set -
-  this is what the native Asana rule on "Priority (Within 24hrs)" sets.
+- "48 hr SLA": reads due_at (full timestamp), stamped directly by
+  sync_yellow_rows_to_asana.py at creation. due_on as a fallback.
+- "Priority (Within 24hrs)": due_at/due_on are both empty right now -
+  the native Asana rule that used to set one was bundled with the
+  now-disabled Slack alert, so disabling the alert also stopped the
+  due-date stamping. Overdue here is instead derived from
+  created_at + 24h (PRIORITY_SLA_HOURS), matching the section's own
+  definition of "due within 24h of landing there." due_at/due_on are
+  still checked first, so this reverts automatically if stamping ever
+  gets restored.
 
 Slack destination:
 #data-processing (the Innova/data-partner channel)
@@ -52,11 +58,24 @@ SLA_SECTIONS = (PRIORITY_SECTION_NAME, STANDARD_SECTION_NAME)
 OPT_FIELDS = (
     "name,"
     "completed,"
+    "created_at,"
     "due_at,"
     "due_on,"
     "assignee.name,"
     "memberships.section.name"
 )
+
+# Priority tasks currently get NO due_at/due_on at all - the native Asana
+# rule that used to stamp one (alongside posting the now-disabled Slack
+# alert) was disabled for noise, and it turns out it was doing both jobs.
+# Rather than depend on a due field that's empty for every Priority task,
+# overdue there is derived straight from the section's own definition:
+# "Priority (Within 24hrs)" means a task is already due within 24h of
+# landing there, so created_at + PRIORITY_SLA_HOURS is treated as its
+# implicit deadline. If due-date stamping on Priority ever gets restored
+# (native rule or script), this section can go back to reading
+# due_at/due_on the same way the 48hr section already does.
+PRIORITY_SLA_HOURS = 24
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_CHANNEL_ID = "C06FNRQBQRE"  # #data-processing
@@ -134,11 +153,16 @@ def get_section_name(task):
     return None
 
 
-def get_due_datetime(task):
-    """Prefer due_at (full timestamp, set by sync_yellow_rows_to_asana.py
-    on '48 hr SLA' tasks). Fall back to due_on (date-only, set by the
-    native Asana rule on 'Priority (Within 24hrs)'), treated as due at
-    midnight UTC that day."""
+def get_due_datetime(task, section_name):
+    """'48 hr SLA': due_at is stamped directly by
+    sync_yellow_rows_to_asana.py at creation - read it, with due_on as a
+    fallback for the rare task predating that field.
+
+    'Priority (Within 24hrs)': due_at/due_on are both empty right now (see
+    PRIORITY_SLA_HOURS comment above) - the implicit deadline is derived
+    from created_at + PRIORITY_SLA_HOURS instead. due_at/due_on are still
+    checked first so this keeps working with no change if due-date
+    stamping on Priority ever gets restored."""
     due_at = task.get("due_at")
     if due_at:
         return dt.datetime.fromisoformat(due_at.replace("Z", "+00:00"))
@@ -146,6 +170,12 @@ def get_due_datetime(task):
     due_on = task.get("due_on")
     if due_on:
         return dt.datetime.fromisoformat(due_on + "T00:00:00+00:00")
+
+    if section_name == PRIORITY_SECTION_NAME:
+        created_at = task.get("created_at")
+        if created_at:
+            created = dt.datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            return created + dt.timedelta(hours=PRIORITY_SLA_HOURS)
 
     return None
 
@@ -201,7 +231,7 @@ def main():
         if section_name not in SLA_SECTIONS:
             continue
 
-        due = get_due_datetime(task)
+        due = get_due_datetime(task, section_name)
         if due is None or due >= now:
             continue
 
