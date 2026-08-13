@@ -1,14 +1,11 @@
 name: SLA breach digest
 
 on:
-  schedule:
-    # Every 4 hours, offset from :00 - avoids piling onto the existing
-    # 12:00 UTC cluster (4 other workflows already fire then). Runs
-    # often enough that a breach doesn't sit unseen for a full day, but
-    # posts nothing at all when there's nothing past due (see
-    # sla_breach_digest.py) so quiet runs generate zero Slack noise.
-    - cron: "15 2,6,10,14,18,22 * * *"
-
+  # Dispatched externally via cron-job.org hitting the workflow_dispatch
+  # endpoint - same pattern as the rest of the repo's workflows. No
+  # native `schedule:` trigger here on purpose: a schedule block that
+  # never actually fires is exactly the kind of stale config that's
+  # easy to mistake for "the real schedule" when debugging later.
   workflow_dispatch:
     inputs:
       dry_run:
