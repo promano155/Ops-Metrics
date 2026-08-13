@@ -1,0 +1,44 @@
+name: SLA breach digest
+
+on:
+  schedule:
+    # Every 4 hours, offset from :00 - avoids piling onto the existing
+    # 12:00 UTC cluster (4 other workflows already fire then). Runs
+    # often enough that a breach doesn't sit unseen for a full day, but
+    # posts nothing at all when there's nothing past due (see
+    # sla_breach_digest.py) so quiet runs generate zero Slack noise.
+    - cron: "15 2,6,10,14,18,22 * * *"
+
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — build digest but DO NOT post to Slack"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run SLA Breach Digest
+        env:
+          ASANA_PAT: ${{ secrets.ASANA_PAT }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            python sla_breach_digest.py --dry-run
+          else
+            python sla_breach_digest.py
+          fi
