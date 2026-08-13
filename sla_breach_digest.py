@@ -4,7 +4,8 @@ sla_breach_digest.py
 Consolidated SLA breach digest for Data Processing Requests.
 
 Replaces the native Asana rule that used to post an SLA breach alert to
-#data-processing directly from the "Priority (Within 24hrs)" section.
+#curacity-innova-hotline directly from the "Priority (Within 24hrs)"
+section.
 That rule was disabled because every hotel is now a standalone top-level
 task (see sync_yellow_rows_to_asana.py) - so a per-task rule meant one
 Slack message PER HOTEL, and volume made the channel unusable.
@@ -35,7 +36,7 @@ Due date handling:
   gets restored.
 
 Slack destination:
-#data-processing (the Innova/data-partner channel)
+#curacity-innova-hotline (the Innova/data-partner channel)
 
 Use --dry-run to print the digest without posting to Slack.
 """
@@ -78,7 +79,7 @@ OPT_FIELDS = (
 PRIORITY_SLA_HOURS = 24
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-SLACK_CHANNEL_ID = "C06FNRQBQRE"  # #data-processing
+SLACK_CHANNEL_ID = "C0BB53W98CF"  # #curacity-innova-hotline
 
 DRY_RUN = False
 
@@ -285,7 +286,7 @@ def main():
         return
 
     send_slack_message(message)
-    print("SLA Breach Digest sent to #data-processing.")
+    print("SLA Breach Digest sent to #curacity-innova-hotline.")
 
 
 if __name__ == "__main__":
