@@ -453,24 +453,43 @@ def already_actioned(dedup_key, dry_run=False):
         return False
 
     task_gid = rows[0].get("asana_task_gid")
-    if task_gid and not asana_task_exists(task_gid):
-        if dry_run:
-            print(f"[DRY RUN] Dedup record for '{dedup_key}' points to Asana task "
-                  f"{task_gid}, which no longer exists - would clear this stale "
-                  f"record and treat the hotel as new (not deleting anything).")
-        else:
-            print(f"Dedup record for '{dedup_key}' points to Asana task {task_gid}, "
-                  f"which no longer exists - clearing the stale record so this hotel "
-                  f"can be re-actioned.")
-            log_stale_recreation(
-                dedup_key,
-                rows[0].get("hotel_name"),
-                task_gid,
-                rows[0].get("month_key"),
-                rows[0].get("due_day_group"),
-            )
-            delete_dedup_record(dedup_key)
-        return False
+    if task_gid:
+        try:
+            task_still_exists = asana_task_exists(task_gid)
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "unknown"
+            # A non-404 failure (403 seen in practice - task exists but is
+            # inaccessible to this token for some reason: permissions,
+            # workspace visibility, etc.) is NOT evidence the task is gone.
+            # Crashing the whole run over one ambiguous record would block
+            # every other hotel too, which is worse than the bug this
+            # guardrail exists to fix. Log it and conservatively treat this
+            # one hotel as still-actioned (skip it, touch nothing) so a
+            # human can investigate this specific dedup_key/task_gid
+            # without holding up everything else.
+            print(f"Warning: could not verify Asana task {task_gid} for dedup_key "
+                  f"'{dedup_key}' (HTTP {status}) - treating as still actioned rather "
+                  f"than risk a duplicate or wrongly clearing a real record. If this "
+                  f"keeps happening for the same task, investigate it directly.")
+            return True
+        if not task_still_exists:
+            if dry_run:
+                print(f"[DRY RUN] Dedup record for '{dedup_key}' points to Asana task "
+                      f"{task_gid}, which no longer exists - would clear this stale "
+                      f"record and treat the hotel as new (not deleting anything).")
+            else:
+                print(f"Dedup record for '{dedup_key}' points to Asana task {task_gid}, "
+                      f"which no longer exists - clearing the stale record so this hotel "
+                      f"can be re-actioned.")
+                log_stale_recreation(
+                    dedup_key,
+                    rows[0].get("hotel_name"),
+                    task_gid,
+                    rows[0].get("month_key"),
+                    rows[0].get("due_day_group"),
+                )
+                delete_dedup_record(dedup_key)
+            return False
 
     return True
 
