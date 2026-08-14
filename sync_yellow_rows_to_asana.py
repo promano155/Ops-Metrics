@@ -622,7 +622,20 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         if not is_truthy(row[col_flag]):
             continue  # not flagged - no action, by design
 
-        dedup_key = f"{target_month}:{hotel_name}"
+        # Keyed on sheet_title, not target_month: target_month is a single
+        # global value (most recent billing period found ANYWHERE in the
+        # sheet), reapplied to every row in this worksheet on every run.
+        # If a row's own Billing Period Analyzed cell gets hand-corrected
+        # (confirmed happening - see "this is an August file not a July
+        # file"-style comments), target_month for that same row can differ
+        # run-to-run even though nothing about the underlying invoice
+        # changed, producing a new dedup_key and a duplicate task for a
+        # hotel that was already actioned. sheet_title is the worksheet
+        # tab itself, which doesn't change when a cell's label is fixed -
+        # a hotel still gets a fresh key each real month (each month has
+        # its own tab), so legitimate month-to-month re-actioning still
+        # works exactly as before.
+        dedup_key = f"{sheet_title}:{hotel_name}"
         if already_actioned(dedup_key):  # read-only either way, safe in dry-run
             continue
 
@@ -667,7 +680,9 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
                   f"in Priority: {names_only}")
         else:
             for hotel_name, data_automated_value in priority_flag_hotels:
-                dedup_key = f"{target_month}:{hotel_name}"
+                dedup_key = f"{sheet_title}:{hotel_name}"  # see Pass 1 comment: keyed on the
+                                                            # worksheet tab, not the mutable
+                                                            # target_month label
                 task_gid = create_standalone_task(hotel_name, target_month, priority_section_gid,
                                                    data_automated=data_automated_value)
                 record_actioned(dedup_key, target_month, hotel_name, task_gid, due_day_group="data_priority_flag")
@@ -717,7 +732,9 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
             target_month, due_day_group, len(hotel_names), apply_staggered_due_date=apply_staggered_due_date
         )
         for hotel_name, data_automated_value in hotel_names:
-            dedup_key = f"{target_month}:{hotel_name}"
+            dedup_key = f"{sheet_title}:{hotel_name}"  # see Pass 1 comment: keyed on the
+                                                        # worksheet tab, not the mutable
+                                                        # target_month label
             task_gid = create_standalone_task(hotel_name, target_month, target_section_gid, due_at=due_at,
                                                data_automated=data_automated_value)
             record_actioned(dedup_key, target_month, hotel_name, task_gid, due_day_group)
