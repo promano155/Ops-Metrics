@@ -106,6 +106,13 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 DEDUP_TABLE = "yellow_row_asana_tasks"
 BATCH_TABLE = "asana_batch_sections"
 STANDARD_BATCH_SEQUENCE_TABLE = "standard_sla_batch_sequence"
+STALE_RECREATION_LOG_TABLE = "stale_task_recreations"  # diagnostics only - not read by any
+                                                        # dedup logic, purely a record of when
+                                                        # already_actioned() found a dedup row
+                                                        # pointing at a deleted Asana task, so a
+                                                        # pattern of accidental deletions (vs. a
+                                                        # one-off during this month's cleanup)
+                                                        # would actually be visible later.
 
 TRUE_VALUES = {"true", "yes", "y", "1", "checked"}
 
@@ -360,7 +367,61 @@ def supabase_headers():
     }
 
 
-def already_actioned(dedup_key):
+def asana_task_exists(task_gid):
+    """GET /tasks/{gid}. Returns False only on a clean 404 (the task was
+    deleted, or never existed) - the one case where it's actually safe to
+    conclude 'gone'. Anything else (auth failure, network error, etc.)
+    re-raises, because those aren't evidence the task is gone and treating
+    them as if it were would let a transient failure silently unblock a
+    hotel that's genuinely still being worked."""
+    url = f"https://app.asana.com/api/1.0/tasks/{task_gid}"
+    resp = requests.get(url, headers=asana_headers(), timeout=30)
+    if resp.status_code == 404:
+        return False
+    resp.raise_for_status()
+    return True
+
+
+def log_stale_recreation(dedup_key, hotel_name, old_task_gid, month_key, due_day_group):
+    """Diagnostics only, called right before a stale dedup record gets
+    cleared (see already_actioned()). Records that a hotel's tracked
+    Asana task had been deleted out from under it, so a repeated pattern
+    of this - as opposed to a one-off from this month's cleanup effort -
+    would actually be visible instead of silently self-healing every
+    time with no trace.
+
+    Best-effort: failures here are logged and swallowed, never raised.
+    A missing diagnostics row is not worth blocking or failing the
+    actual recreation of a hotel's task over."""
+    payload = {
+        "dedup_key": dedup_key,
+        "hotel_name": hotel_name,
+        "old_asana_task_gid": old_task_gid,
+        "month_key": month_key,
+        "due_day_group": due_day_group,
+        "detected_at": dt.datetime.utcnow().isoformat(),
+    }
+    try:
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/{STALE_RECREATION_LOG_TABLE}",
+            headers=supabase_headers(),
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"Warning: failed to log stale-recreation diagnostics for '{dedup_key}' "
+              f"(continuing anyway - this is diagnostics-only, not the actual fix): {e}")
+
+
+def delete_dedup_record(dedup_key):
+    url = f"{SUPABASE_URL}/rest/v1/{DEDUP_TABLE}"
+    params = {"dedup_key": f"eq.{dedup_key}"}
+    resp = requests.delete(url, headers=supabase_headers(), params=params, timeout=30)
+    resp.raise_for_status()
+
+
+def already_actioned(dedup_key, dry_run=False):
     """Uses params= so requests properly URL-encodes dedup_key - hotel
     names routinely contain commas and ampersands ('Resort & Suites',
     'Sky Rock Sedona, a Tribute Portfolio Hotel'), and an unencoded '&'
@@ -368,15 +429,53 @@ def already_actioned(dedup_key):
     of being part of the value. That silently broke this exact check for
     every hotel with such a character in its name - it would always come
     back 'not found' even for genuinely already-actioned hotels, which is
-    precisely how this produced systemic, not occasional, duplicates."""
+    precisely how this produced systemic, not occasional, duplicates.
+
+    A matching row alone isn't enough to conclude 'already handled' -
+    confirmed real incident: a hotel's Asana task got deleted (cause
+    unconfirmed - manual mistake, or a cleanup script), but its dedup
+    record survived, silently blocking that hotel from ever being
+    re-actioned even though nothing was actually tracking it anymore.
+    'Flag to Innova' stayed checked, the row looked untouched, and
+    nothing about this produced an error or a visible symptom - it just
+    never created a task. So this also verifies the referenced task
+    still exists, and if it doesn't, logs the stale-recreation event for
+    diagnostics (see log_stale_recreation) and clears the stale record
+    (unless dry_run, which still runs every check but never writes) so
+    the hotel is treated as new again on this and future runs."""
     url = f"{SUPABASE_URL}/rest/v1/{DEDUP_TABLE}"
-    params = {"dedup_key": f"eq.{dedup_key}", "select": "dedup_key"}
+    params = {"dedup_key": f"eq.{dedup_key}",
+              "select": "dedup_key,asana_task_gid,hotel_name,month_key,due_day_group"}
     resp = requests.get(url, headers=supabase_headers(), params=params, timeout=30)
     resp.raise_for_status()
-    return len(resp.json()) > 0
+    rows = resp.json()
+    if not rows:
+        return False
+
+    task_gid = rows[0].get("asana_task_gid")
+    if task_gid and not asana_task_exists(task_gid):
+        if dry_run:
+            print(f"[DRY RUN] Dedup record for '{dedup_key}' points to Asana task "
+                  f"{task_gid}, which no longer exists - would clear this stale "
+                  f"record and treat the hotel as new (not deleting anything).")
+        else:
+            print(f"Dedup record for '{dedup_key}' points to Asana task {task_gid}, "
+                  f"which no longer exists - clearing the stale record so this hotel "
+                  f"can be re-actioned.")
+            log_stale_recreation(
+                dedup_key,
+                rows[0].get("hotel_name"),
+                task_gid,
+                rows[0].get("month_key"),
+                rows[0].get("due_day_group"),
+            )
+            delete_dedup_record(dedup_key)
+        return False
+
+    return True
 
 
-def already_actioned_with_legacy_fallback(sheet_title, target_month, hotel_name):
+def already_actioned_with_legacy_fallback(sheet_title, target_month, hotel_name, dry_run=False):
     """Checks the current dedup_key format (sheet_title:hotel_name) and,
     only if that misses, ALSO checks the legacy format (target_month:
     hotel_name) that every pre-existing Supabase row was written under.
@@ -389,12 +488,17 @@ def already_actioned_with_legacy_fallback(sheet_title, target_month, hotel_name)
     completed or not. This is a one-way migration bridge: new work is
     always recorded under the new key (see record_actioned call sites),
     so as older legacy-keyed rows age past relevance this fallback check
-    simply stops finding matches and can eventually be removed."""
+    simply stops finding matches and can eventually be removed.
+
+    dry_run is passed through to already_actioned() purely to suppress
+    its stale-record cleanup delete - the existence CHECK itself (both
+    Supabase reads and the Asana task-existence lookup) still runs either
+    way, so dry-run output accurately reflects what a real run would see."""
     new_key = f"{sheet_title}:{hotel_name}"
-    if already_actioned(new_key):
+    if already_actioned(new_key, dry_run=dry_run):
         return True
     legacy_key = f"{target_month}:{hotel_name}"
-    return already_actioned(legacy_key)
+    return already_actioned(legacy_key, dry_run=dry_run)
 
 
 def record_actioned(dedup_key, month_key, hotel_name, subtask_gid, due_day_group):
@@ -657,7 +761,7 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         # its own tab), so legitimate month-to-month re-actioning still
         # works exactly as before.
         dedup_key = f"{sheet_title}:{hotel_name}"
-        if already_actioned_with_legacy_fallback(sheet_title, target_month, hotel_name):
+        if already_actioned_with_legacy_fallback(sheet_title, target_month, hotel_name, dry_run=dry_run):
             # read-only either way, safe in dry-run
             continue
 
