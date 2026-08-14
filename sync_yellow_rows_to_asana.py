@@ -376,6 +376,27 @@ def already_actioned(dedup_key):
     return len(resp.json()) > 0
 
 
+def already_actioned_with_legacy_fallback(sheet_title, target_month, hotel_name):
+    """Checks the current dedup_key format (sheet_title:hotel_name) and,
+    only if that misses, ALSO checks the legacy format (target_month:
+    hotel_name) that every pre-existing Supabase row was written under.
+
+    Without this fallback, switching dedup_key from target_month-based to
+    sheet_title-based (fixing the mislabeled-billing-period duplicate bug)
+    would make every previously-actioned hotel look brand new the first
+    time this runs after the change - none of the old rows match the new
+    key format - and mass-recreate a task for every hotel ever processed,
+    completed or not. This is a one-way migration bridge: new work is
+    always recorded under the new key (see record_actioned call sites),
+    so as older legacy-keyed rows age past relevance this fallback check
+    simply stops finding matches and can eventually be removed."""
+    new_key = f"{sheet_title}:{hotel_name}"
+    if already_actioned(new_key):
+        return True
+    legacy_key = f"{target_month}:{hotel_name}"
+    return already_actioned(legacy_key)
+
+
 def record_actioned(dedup_key, month_key, hotel_name, subtask_gid, due_day_group):
     payload = {
         "dedup_key": dedup_key,
@@ -636,7 +657,8 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         # its own tab), so legitimate month-to-month re-actioning still
         # works exactly as before.
         dedup_key = f"{sheet_title}:{hotel_name}"
-        if already_actioned(dedup_key):  # read-only either way, safe in dry-run
+        if already_actioned_with_legacy_fallback(sheet_title, target_month, hotel_name):
+            # read-only either way, safe in dry-run
             continue
 
         data_automated_value = (
@@ -682,7 +704,9 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
             for hotel_name, data_automated_value in priority_flag_hotels:
                 dedup_key = f"{sheet_title}:{hotel_name}"  # see Pass 1 comment: keyed on the
                                                             # worksheet tab, not the mutable
-                                                            # target_month label
+                                                            # target_month label. Already passed
+                                                            # already_actioned_with_legacy_fallback
+                                                            # in Pass 1, above.
                 task_gid = create_standalone_task(hotel_name, target_month, priority_section_gid,
                                                    data_automated=data_automated_value)
                 record_actioned(dedup_key, target_month, hotel_name, task_gid, due_day_group="data_priority_flag")
