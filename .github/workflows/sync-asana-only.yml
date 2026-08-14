@@ -1,17 +1,18 @@
 name: Yellow-row Asana sync (standalone)
 
-# Manual-only, for fast testing/dry-runs of just this one script. The
-# real daily run still happens via data_processing_sync.yml alongside
-# the other three scripts - this file is purely a faster iteration tool
-# and is never triggered automatically.
+# Manual-only, for fast testing/live runs of just this one script. The
+# real daily run still happens via Javi_team_sync.yml alongside the
+# other three scripts - this file is purely a faster iteration tool
+# and is never triggered automatically. Runs LIVE by default; pass
+# --dry-run in yellow_row_args to test without writing anything.
 
 on:
   workflow_dispatch:
     inputs:
       yellow_row_args:
-        description: 'Args for the script, e.g. --dry-run or --dry-run --month 2026-07'
+        description: 'Args for the script. Runs LIVE by default - pass --dry-run to test without writing anything, e.g. --dry-run or --dry-run --month 2026-07'
         required: false
-        default: '--dry-run'
+        default: ''
 
 jobs:
   sync:
