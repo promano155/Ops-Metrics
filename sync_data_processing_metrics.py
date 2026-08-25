@@ -144,12 +144,32 @@ def parse_date(value, reference_year):
 
 
 def parse_billing_period(value):
+    """Returns the month from the END of a '{start} - {end}' range,
+    always - not whichever date happens to come first in the string.
+
+    Confirmed 2026-08-25: multi-month catch-up/backfill periods like
+    '6.1.26 - 7.31.26' or '2.1.26 - 7.31.26' are real and current in
+    this sheet - they represent a correction or backfill that covers
+    several months but is being processed/reported as part of THIS
+    end month. The previous version of this function took the FIRST
+    date match, silently filing 12 real July rows under February/
+    May/June instead - the same bug already fixed in
+    sync_yellow_rows_to_asana.py's parse_billing_period, which takes
+    the second date positionally, but that fix was never carried over
+    to this script.
+
+    Uses the LAST match rather than strictly the second, which is a
+    superset of that same fix: for a normal two-date range they're
+    identical, but it also correctly resolves the rare compound cell
+    that concatenates more than one range in one string (e.g.
+    '3.1.26 - 3.31.26 / 6.1.26 - 7.31.26') by taking the true end of
+    the whole string rather than the second of four matches."""
     if not value:
         return None
-    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", value)
-    if not m:
+    matches = re.findall(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", value)
+    if not matches:
         return None
-    month, _day, year = m.groups()
+    month, _day, year = matches[-1]
     year = int(year)
     if year < 100:
         year += 2000
@@ -383,6 +403,7 @@ def list_rows_for_billing_period(spreadsheet, target_billing_period):
             # as informational context (e.g. to spot a forgotten Data
             # Uploaded checkbox), never as a reason something doesn't count.
             within_sla = sent_in_window
+            unparseable_send_date = sent_flag and not send_date and str(row[col_send_date] if len(row) > col_send_date else "").strip() != ""
 
             records.append({
                 "sheet_title": ws.title,
@@ -395,6 +416,7 @@ def list_rows_for_billing_period(spreadsheet, target_billing_period):
                 "send_date_parsed": send_date.isoformat() if send_date else None,
                 "eligible": eligible,
                 "counted_within_sla": within_sla,
+                "unparseable_send_date": unparseable_send_date,
             })
 
             if send_date is not None and window_start <= send_date <= cutoff:
