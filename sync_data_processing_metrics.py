@@ -11,13 +11,16 @@ Run daily via GitHub Actions (see data-processing-sync.yml).
 --- Design notes / assumptions (confirm these match reality before trusting numbers) ---
 1. "Eligible files" = rows where the Data Uploaded flag is Yes/TRUE AND an
    Upload Date is present.
-2. "Sent within 7 business days" = eligible rows where a Send Date is present
-   AND the number of weekday-only business days between Upload Date and
-   Send Date is <= 7. Business days = Mon-Fri, no holiday calendar applied.
-   The upload day itself counts as day 1 of the window - confirmed
-   2026-08-25 (a file uploaded Monday 8/3 and sent Tuesday 8/11 is within
-   a 7-business-day SLA, not 8). If you observe federal holidays in your
-   SLA, tell me and I'll add a holiday list.
+2. "Sent within 7 business days" = eligible rows with a Send Date on or
+   before a FIXED cutoff: the 7th business day of the REPORTING month
+   (the month the actual processing work happens in - see point 6),
+   counting that month's 1st business day as day 1. This is NOT a
+   rolling per-row clock that starts on each file's own Upload Date -
+   confirmed 2026-08-25. Every file in the cohort is held to the same
+   deadline regardless of which day within the month it was uploaded:
+   a file uploaded on the month's 1st business day and one uploaded on
+   the 15th both had to be sent by the SAME cutoff date. Business days
+   = Mon-Fri, no holiday calendar applied.
 3. "Total files sent" (previous-month closed card) = count of rows in that
    month where the Results Sent flag is Yes/TRUE, regardless of how long it
    took. This is a different, broader number than "sent within 7 days."
@@ -147,29 +150,29 @@ def parse_billing_period(value):
     return f"{year:04d}-{month:02d}", year
 
 
-def business_days_elapsed(start_date, end_date):
-    """Count business days from start_date THROUGH end_date, INCLUSIVE
-    of both ends - the upload day itself counts as day 1 of the SLA
-    window. Confirmed 2026-08-25: a file uploaded Monday 8/3 and sent
-    Tuesday 8/11 is within a 7-business-day SLA (8/3=1, 8/4=2, 8/5=3,
-    8/6=4, 8/7=5, [weekend], 8/10=6, 8/11=7), not 8.
+def nth_business_day_of_month(year, month, n):
+    """Returns the date of the Nth business day (Mon-Fri, no holiday
+    calendar) of the given month, counting the 1st business day as day
+    1 - inclusive, same convention confirmed for the SLA window itself.
+    E.g. August 2026 starts on a Saturday, so 8/3 is the 1st business
+    day and 8/11 is the 7th.
 
-    Previously this started counting the day AFTER start_date, which
-    silently extended every file's effective deadline by one business
-    day and undercounted how many files were actually sent within the
-    real 7-business-day window. Returns None if inputs are missing or
-    out of order."""
-    if start_date is None or end_date is None:
-        return None
-    if end_date < start_date:
-        return None
-    days = 0
-    current = start_date
-    while current <= end_date:
-        if current.weekday() < 5:  # Mon-Fri
-            days += 1
-        current += dt.timedelta(days=1)
-    return days
+    This replaces the old per-row business_days_elapsed(upload_date,
+    send_date) calculation entirely - confirmed 2026-08-25: the 7-day
+    SLA window is NOT a rolling clock that starts on each file's own
+    Upload Date. It's a single fixed cutoff for the whole month's
+    cohort, anchored to the start of the month everyone's working in.
+    A file uploaded on the 1st business day and one uploaded on the
+    15th are held to the exact same deadline - the month's 7th business
+    day - not to 7 business days after their own individual upload."""
+    d = dt.date(year, month, 1)
+    count = 0
+    while True:
+        if d.weekday() < 5:
+            count += 1
+            if count == n:
+                return d
+        d += dt.timedelta(days=1)
 
 
 @dataclass
@@ -210,8 +213,32 @@ def get_all_values_with_retry(ws):
     raise RuntimeError(f"Still rate limited reading '{ws.title}' after {SHEETS_MAX_RETRIES} retries")
 
 
+def shift_month_key(month_key, n):
+    """Shifts a 'YYYY-MM' key forward (or back, if n is negative) by n
+    months. Used to convert a BILLING PERIOD (which tab/period was read
+    from the sheet) into a REPORTING label (which month's throughput this
+    counts toward on the dashboard) - these are deliberately different:
+    July's billing period is processed in August, so July's billing-
+    period data should be labeled and displayed as August's result, and
+    the SLA cutoff itself should be computed against AUGUST's calendar
+    (since that's the month the actual upload/send dates fall in), not
+    July's."""
+    year, month = (int(x) for x in month_key.split("-"))
+    total = year * 12 + (month - 1) + n
+    year, month = divmod(total, 12)
+    return f"{year:04d}-{month + 1:02d}"
+
+
 def extract_month_aggregates(spreadsheet, months_wanted):
     aggs = {mk: MonthAgg() for mk in months_wanted}
+
+    # One fixed SLA cutoff per billing period, computed against the
+    # REPORT month's calendar (where the actual upload/send dates live),
+    # not the billing period's own month.
+    cutoffs = {}
+    for billing_period in months_wanted:
+        report_year, report_month = (int(x) for x in shift_month_key(billing_period, 1).split("-"))
+        cutoffs[billing_period] = nth_business_day_of_month(report_year, report_month, BUSINESS_DAY_SLA)
 
     for ws in spreadsheet.worksheets():
         try:
@@ -254,8 +281,7 @@ def extract_month_aggregates(spreadsheet, months_wanted):
             if uploaded_flag and upload_date:
                 agg.eligible_files += 1
                 if sent_flag and send_date:
-                    elapsed = business_days_elapsed(upload_date, send_date)
-                    if elapsed is not None and elapsed <= BUSINESS_DAY_SLA:
+                    if send_date <= cutoffs[month_key]:
                         agg.sent_within_sla += 1
 
             if sent_flag:
@@ -269,17 +295,21 @@ def list_rows_for_billing_period(spreadsheet, target_billing_period):
     worksheet the same way extract_month_aggregates does, but instead of
     only tallying counts, returns one record per row whose Billing
     Period Analyzed matches target_billing_period, showing exactly which
-    sheet tab it came from, its hotel name, upload/send dates, computed
-    elapsed business days, and whether it counted as eligible / within
-    SLA. Built specifically to let a human compare against known-correct
-    numbers and point at the exact rows causing a discrepancy, rather
-    than guessing at the cause from aggregate counts alone.
+    sheet tab it came from, its hotel name, upload/send dates, the
+    month's fixed SLA cutoff, and whether it counted as eligible /
+    within SLA. Built specifically to let a human compare against
+    known-correct numbers and point at the exact rows causing a
+    discrepancy, rather than guessing at the cause from aggregate counts
+    alone.
 
     Also flags duplicate (sheet-independent) hotel+date combinations
     that appear on MORE than one worksheet tab under the same billing
     period label - a real way overcounting can happen, since this
     script (by design, to survive tab-naming drift) buckets by the
     Billing Period Analyzed VALUE, not by which tab it's on."""
+    report_year, report_month = (int(x) for x in shift_month_key(target_billing_period, 1).split("-"))
+    cutoff = nth_business_day_of_month(report_year, report_month, BUSINESS_DAY_SLA)
+
     records = []
     for ws in spreadsheet.worksheets():
         try:
@@ -318,8 +348,7 @@ def list_rows_for_billing_period(spreadsheet, target_billing_period):
             send_date = parse_date(row[col_send_date], year)
 
             eligible = bool(uploaded_flag and upload_date)
-            elapsed = business_days_elapsed(upload_date, send_date) if (sent_flag and send_date) else None
-            within_sla = eligible and elapsed is not None and elapsed <= BUSINESS_DAY_SLA
+            within_sla = eligible and sent_flag and send_date is not None and send_date <= cutoff
 
             records.append({
                 "sheet_title": ws.title,
@@ -329,25 +358,25 @@ def list_rows_for_billing_period(spreadsheet, target_billing_period):
                 "upload_date_parsed": upload_date.isoformat() if upload_date else None,
                 "send_date_raw": row[col_send_date] if len(row) > col_send_date else "",
                 "send_date_parsed": send_date.isoformat() if send_date else None,
-                "elapsed_business_days": elapsed,
                 "eligible": eligible,
                 "counted_within_sla": within_sla,
             })
 
-    return records
+    return records, cutoff
 
 
-def print_diagnostic_listing(records):
+def print_diagnostic_listing(records, cutoff):
     within_sla_records = [r for r in records if r["counted_within_sla"]]
-    print(f"\n{len(records)} total rows matched this billing period across all tabs.")
+    print(f"\nSLA cutoff for this month: {cutoff.isoformat()} (fixed for the whole cohort, "
+          f"not per-row).")
+    print(f"{len(records)} total rows matched this billing period across all tabs.")
     print(f"{len(within_sla_records)} currently counted as 'within 7 business days'.\n")
 
     print("--- Rows counted as within SLA ---")
     for r in within_sla_records:
         print(f"  [{r['sheet_title']} row {r['row_num']}] {r['hotel_name']}: "
               f"uploaded {r['upload_date_raw']!r} -> {r['upload_date_parsed']}, "
-              f"sent {r['send_date_raw']!r} -> {r['send_date_parsed']}, "
-              f"elapsed={r['elapsed_business_days']}bd")
+              f"sent {r['send_date_raw']!r} -> {r['send_date_parsed']}")
 
     # Duplicate detection: same hotel + same parsed send date appearing
     # on more than one sheet tab under this billing period - a real
@@ -429,13 +458,6 @@ def month_key_n_back(n):
     return f"{year:04d}-{month:02d}"
 
 
-def shift_month_key(month_key, n):
-    year, month = (int(x) for x in month_key.split("-"))
-    total = year * 12 + (month - 1) + n
-    year, month = divmod(total, 12)
-    return f"{year:04d}-{month + 1:02d}"
-
-
 def main(force_months=None, dry_run=False):
     force_months = set(force_months or [])
     current_billing_period = month_key_n_back(0)
@@ -481,7 +503,7 @@ if __name__ == "__main__":
     if args.list_rows:
         gc = get_gspread_client()
         spreadsheet = gc.open_by_key(SHEET_ID)
-        records = list_rows_for_billing_period(spreadsheet, args.list_rows)
-        print_diagnostic_listing(records)
+        records, cutoff = list_rows_for_billing_period(spreadsheet, args.list_rows)
+        print_diagnostic_listing(records, cutoff)
     else:
         main(force_months=args.month, dry_run=args.dry_run)
