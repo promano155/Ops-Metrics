@@ -14,8 +14,10 @@ Run daily via GitHub Actions (see data-processing-sync.yml).
 2. "Sent within 7 business days" = eligible rows where a Send Date is present
    AND the number of weekday-only business days between Upload Date and
    Send Date is <= 7. Business days = Mon-Fri, no holiday calendar applied.
-   If you observe federal holidays in your SLA, tell me and I'll add a
-   holiday list.
+   The upload day itself counts as day 1 of the window - confirmed
+   2026-08-25 (a file uploaded Monday 8/3 and sent Tuesday 8/11 is within
+   a 7-business-day SLA, not 8). If you observe federal holidays in your
+   SLA, tell me and I'll add a holiday list.
 3. "Total files sent" (previous-month closed card) = count of rows in that
    month where the Results Sent flag is Yes/TRUE, regardless of how long it
    took. This is a different, broader number than "sent within 7 days."
@@ -44,7 +46,6 @@ Run daily via GitHub Actions (see data-processing-sync.yml).
 
 import os
 import re
-import sys
 import json
 import time
 import datetime as dt
@@ -60,12 +61,6 @@ from google.oauth2.service_account import Credentials
 
 SHEET_ID = "10osrvx4zsemAQy3rAci2tbV3cAzRBSM8ocecbnuw76I"
 
-# The workbook has 40+ monthly tabs. Reading each one with get_all_values()
-# in a tight loop reliably hits the Sheets API's per-minute read quota -
-# this caused a real incident where most tabs were silently skipped and
-# only one made it into Supabase. Every read is now retried with backoff
-# on rate-limit errors, and throttled up front to avoid hitting the wall
-# in the first place.
 SHEETS_REQUEST_DELAY_SECONDS = 1.1
 SHEETS_MAX_RETRIES = 5
 
@@ -73,17 +68,13 @@ SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 SUPABASE_TABLE = "data_processing_monthly_metrics"
 
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]  # raw JSON string secret
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
-TRAILING_MONTHS = 24  # how far back to backfill/consider for the trend line
+TRAILING_MONTHS = 24
 BUSINESS_DAY_SLA = 7
-MONTH_OFFSET = 1  # the actively-worked tab is always the PREVIOUS calendar
-                  # month, not the current one - confirmed with the team.
-                  # e.g. in late July, the live/active tab is still June's.
+MONTH_OFFSET = 1
 
-# Column name aliases. Matching is case-insensitive and ignores surrounding
-# whitespace. Add new observed variants here as the sheet evolves.
 COLUMN_ALIASES = {
     "billing_period": ["Billing Period Analyzed", "Period Being Analyzed"],
     "data_uploaded_flag": ["Data Uploaded (Yes/No)", "Data Uploaded"],
@@ -122,10 +113,6 @@ def is_truthy(value):
 
 
 def parse_date(value, reference_year):
-    """Parses the sheet's loose date formats (M/D, M/D/YY, M/D/YYYY, etc).
-    Sheet dates without a year (e.g. '7/1') are assumed to fall in
-    reference_year, which the caller should set to the billing month's year.
-    """
     if not value or not str(value).strip():
         return None
     value = str(value).strip()
@@ -135,7 +122,6 @@ def parse_date(value, reference_year):
             return dt.datetime.strptime(value, fmt).date()
         except ValueError:
             continue
-    # No-year format like "7/1" or "7/8"
     m = re.match(r"^(\d{1,2})/(\d{1,2})$", value)
     if m:
         month, day = int(m.group(1)), int(m.group(2))
@@ -147,7 +133,6 @@ def parse_date(value, reference_year):
 
 
 def parse_billing_period(value):
-    """'6.1.26 - 6.30.26' -> (month_key='2026-06', year=2026)."""
     if not value:
         return None
     m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", value)
@@ -162,14 +147,23 @@ def parse_billing_period(value):
 
 
 def business_days_elapsed(start_date, end_date):
-    """Count weekday-only business days strictly after start_date through
-    end_date inclusive. Returns None if inputs are missing or out of order."""
+    """Count business days from start_date THROUGH end_date, INCLUSIVE
+    of both ends - the upload day itself counts as day 1 of the SLA
+    window. Confirmed 2026-08-25: a file uploaded Monday 8/3 and sent
+    Tuesday 8/11 is within a 7-business-day SLA (8/3=1, 8/4=2, 8/5=3,
+    8/6=4, 8/7=5, [weekend], 8/10=6, 8/11=7), not 8.
+
+    Previously this started counting the day AFTER start_date, which
+    silently extended every file's effective deadline by one business
+    day and undercounted how many files were actually sent within the
+    real 7-business-day window. Returns None if inputs are missing or
+    out of order."""
     if start_date is None or end_date is None:
         return None
     if end_date < start_date:
         return None
     days = 0
-    current = start_date + dt.timedelta(days=1)
+    current = start_date
     while current <= end_date:
         if current.weekday() < 5:  # Mon-Fri
             days += 1
@@ -197,10 +191,6 @@ def get_gspread_client():
 
 
 def get_all_values_with_retry(ws):
-    """Reads a worksheet's values, retrying with backoff on rate-limit
-    errors instead of silently giving up. This is the fix for a real
-    incident where a plain try/except swallowed 429s across ~40 tabs and
-    only one tab's data ever made it into Supabase."""
     for attempt in range(SHEETS_MAX_RETRIES):
         try:
             values = ws.get_all_values()
@@ -219,19 +209,7 @@ def get_all_values_with_retry(ws):
     raise RuntimeError(f"Still rate limited reading '{ws.title}' after {SHEETS_MAX_RETRIES} retries")
 
 
-def relevant_worksheets(spreadsheet, cutoff_month_key):
-    """Returns worksheets worth scanning: anything whose title looks like a
-    month/year tab, without assuming an exact naming scheme (tab-naming has
-    drifted over the years). We filter by content (Billing Period column),
-    not by tab title, so this is robust to that drift."""
-    return spreadsheet.worksheets()
-
-
 def extract_month_aggregates(spreadsheet, months_wanted):
-    """Scans all worksheets once, bucketing rows into MonthAgg by their
-    actual Billing Period Analyzed value (not by tab name), since a single
-    tab occasionally contains rows spanning more than one billing period.
-    Returns {month_key: MonthAgg}."""
     aggs = {mk: MonthAgg() for mk in months_wanted}
 
     for ws in spreadsheet.worksheets():
@@ -250,8 +228,6 @@ def extract_month_aggregates(spreadsheet, months_wanted):
         col_sent_flag = find_col_index(headers, "results_sent_flag")
         col_send_date = find_col_index(headers, "send_date")
 
-        # Skip tabs that don't have the columns we need at all (reference
-        # tabs like "Go Live Fees", contact directories, etc.)
         if col_period is None or col_upload_date is None or col_send_date is None:
             continue
 
@@ -310,7 +286,7 @@ def fetch_existing_month_keys(status_filter=None):
     return {r["month_key"] for r in rows}
 
 
-def upsert_month(month_key, agg, status):
+def upsert_month(month_key, agg, status, dry_run=False):
     rate = (agg.sent_within_sla / agg.eligible_files * 100) if agg.eligible_files else None
     payload = {
         "month_key": month_key,
@@ -321,6 +297,9 @@ def upsert_month(month_key, agg, status):
         "status": status,
         "updated_at": dt.datetime.utcnow().isoformat(),
     }
+    if dry_run:
+        print(f"[DRY RUN] Would upsert {month_key} ({status}): {payload}")
+        return
     url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
     resp = requests.post(
         url,
@@ -348,36 +327,18 @@ def month_key_n_back(n):
 
 
 def shift_month_key(month_key, n):
-    """Shifts a 'YYYY-MM' key forward/back by n months. Used to convert
-    a billing-period month into its REPORTING label: work done processing
-    July's billing period happens in August, so it's reported as August's
-    throughput, not July's - the billing period itself is unaffected,
-    only the label this data is stored/displayed under."""
     year, month = (int(x) for x in month_key.split("-"))
     total = year * 12 + (month - 1) + n
     year, month = divmod(total, 12)
     return f"{year:04d}-{month + 1:02d}"
 
 
-def shift_month_key(month_key, n):
-    """Shifts a 'YYYY-MM' key forward (or back, if n is negative) by n
-    months. Used to convert a BILLING PERIOD (which tab/period was read
-    from the sheet) into a REPORTING label (which month's throughput this
-    counts toward on the dashboard) - these are deliberately different:
-    July's billing period is processed in August, so July's billing-
-    period data should be labeled and displayed as August's result."""
-    year, month = (int(x) for x in month_key.split("-"))
-    total = year * 12 + (month - 1) + n
-    year, month = divmod(total, 12)
-    return f"{year:04d}-{month + 1:02d}"
-
-
-def main(force_months=None):
-    force_months = set(force_months or [])  # these are REPORTING labels, e.g. '2026-08'
-    current_billing_period = month_key_n_back(0)  # the billing period actively being worked right now
+def main(force_months=None, dry_run=False):
+    force_months = set(force_months or [])
+    current_billing_period = month_key_n_back(0)
     wanted_billing_periods = [month_key_n_back(n) for n in range(TRAILING_MONTHS + 1)]
 
-    already_closed = fetch_existing_month_keys(status_filter="closed")  # these are REPORTING labels too
+    already_closed = fetch_existing_month_keys(status_filter="closed")
 
     gc = get_gspread_client()
     spreadsheet = gc.open_by_key(SHEET_ID)
@@ -387,26 +348,26 @@ def main(force_months=None):
     for billing_period in wanted_billing_periods:
         agg = aggs.get(billing_period)
         if agg is None or agg.rows_seen == 0:
-            continue  # no data found for this billing period in the sheet yet/anymore
+            continue
 
-        # The billing period itself is correct as read - only the LABEL
-        # this gets stored/displayed under shifts forward one month.
-        # Processing July's billing period happens in August, so this
-        # data is August's throughput number, not July's.
         report_month_key = shift_month_key(billing_period, 1)
 
         if billing_period == current_billing_period:
-            upsert_month(report_month_key, agg, status="current")
+            upsert_month(report_month_key, agg, status="current", dry_run=dry_run)
         elif report_month_key in already_closed and report_month_key not in force_months:
-            continue  # locked - do not silently change already-reported numbers
+            continue
         else:
-            upsert_month(report_month_key, agg, status="closed")
+            upsert_month(report_month_key, agg, status="closed", dry_run=dry_run)
 
 
 if __name__ == "__main__":
-    # Optional: python sync_data_processing_metrics.py 2026-08 2026-07
-    # forces a recompute of specific already-closed months. These are
-    # REPORTING labels (what you see on the dashboard), not billing
-    # periods - e.g. pass '2026-08' to force-recompute August's row,
-    # which is built from July's billing-period tab.
-    main(force_months=sys.argv[1:])
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true",
+                         help="No Supabase writes - just prints what would happen.")
+    parser.add_argument("--month", type=str, action="append", default=None,
+                         help="Force-recompute a specific already-closed REPORTING month "
+                              "(e.g. 2026-08). Repeatable.")
+    args = parser.parse_args()
+
+    main(force_months=args.month, dry_run=args.dry_run)
