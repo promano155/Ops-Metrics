@@ -63,6 +63,23 @@ Javiana Pacheco, Lucas Berberian, or Victoria Camacho:
    ball. If that scope should widen, say so explicitly rather than
    assuming - this was a specific, scoped ask.
 
+3. TOP BLOCKER (monthly, per scope) - which of the six blocker stages
+   (the four above, plus CS Feedback Required and Client Input Required
+   - a wider set than #2 uses, by explicit request) ate the most total
+   hours across that scope's closed tickets this month. Computed from
+   the same hs_v2_cumulative_time_in_<stageId> fields already being
+   pulled for #2, just summed across ALL closed tickets in the month
+   rather than per-ticket. tech_hours / finance_hours / media_brand_hours
+   / innova_hours / cs_feedback_hours / hotel_client_hours are the raw
+   per-stage totals (in hours); top_blocker / top_blocker_hours name
+   whichever one was largest. A month with nothing in any blocker stage
+   gets top_blocker = None, not a misleading zero-hour "winner."
+
+   The team's top_blocker is recomputed from the SUMMED totals across
+   Javiana/Lucas/Victoria, not derived from their three individual top
+   blockers - those can legitimately disagree with each other and with
+   the team's own answer once combined.
+
 --- Why per-ticket fetch instead of count-only search now ---
 The old version only ever asked HubSpot for two counts (total closed,
 within-SLA) via the search endpoint's `total`. That's enough for the
@@ -137,12 +154,33 @@ BUCKET_BY_STAGE_ID = {
 }
 BUCKET_NAMES = ["with_ops", "cs_feedback", "tech", "finance", "media_brand", "innova", "hotel_client", "long_term"]
 
-# The four "another team/vendor is holding this" stages whose time gets
-# subtracted for the adjusted SLA metric. Deliberately excludes CS
-# Feedback Required and Client Input Required - narrower, explicitly-
-# scoped ask, not "anything not with_ops."
-OTHER_TEAM_STAGE_IDS = ["1008389482", "1020326275", "1061150809", "1405980051"]
-OTHER_TEAM_TIME_FIELDS = [f"hs_v2_cumulative_time_in_{sid}" for sid in OTHER_TEAM_STAGE_IDS]
+# All 6 "someone other than ops is holding this" stages, for the
+# top-blocker card. Keys match the bucket names used for open tickets so
+# the two views use consistent language.
+BLOCKER_STAGE_FIELDS = {
+    "tech": "hs_v2_cumulative_time_in_1008389482",
+    "finance": "hs_v2_cumulative_time_in_1020326275",
+    "media_brand": "hs_v2_cumulative_time_in_1061150809",
+    "innova": "hs_v2_cumulative_time_in_1405980051",
+    "cs_feedback": "hs_v2_cumulative_time_in_3",
+    "hotel_client": "hs_v2_cumulative_time_in_4",
+}
+BLOCKER_LABELS = {
+    "tech": "Tech",
+    "finance": "Finance",
+    "media_brand": "Media/brand",
+    "innova": "Innova",
+    "cs_feedback": "CS feedback",
+    "hotel_client": "Hotel/client",
+}
+
+# Narrower subset used ONLY for the adjusted-SLA time subtraction -
+# another INTERNAL team or the vendor holding the ball, not CS or the
+# client. Derived from BLOCKER_STAGE_FIELDS so the two lists can't drift
+# apart from each other by accident.
+OTHER_TEAM_TIME_FIELDS = [
+    BLOCKER_STAGE_FIELDS[k] for k in ("tech", "finance", "media_brand", "innova")
+]
 
 TRAILING_MONTHS = 24
 
@@ -283,7 +321,7 @@ def upsert_open_buckets(scope, bucket_counts):
 CLOSED_TICKET_PROPERTIES = [
     "hubspot_owner_id", "createdate", "closed_date", "time_to_close",
     "time_to_close__met_sla", "hs_time_to_close_sla_at",
-] + OTHER_TEAM_TIME_FIELDS
+] + list(BLOCKER_STAGE_FIELDS.values())
 
 
 def fetch_closed_tickets_for_owner_month(owner_id, month_key):
@@ -328,12 +366,38 @@ def ticket_sla_outcome(props):
     return met_raw, met_adjusted, True
 
 
+def blocker_hours_for_ticket(props):
+    """Returns {bucket_key: hours} for all 6 blocker stages on one
+    ticket, converting HubSpot's millisecond cumulative-time fields to
+    hours. Missing/blank fields count as 0 (ticket never sat there)."""
+    hours = {}
+    for key, field in BLOCKER_STAGE_FIELDS.items():
+        val = props.get(field)
+        ms = int(val) if val not in (None, "") else 0
+        hours[key] = ms / 3_600_000
+    return hours
+
+
+def top_blocker(total_hours):
+    """Given {bucket_key: total_hours} summed across a month's closed
+    tickets, returns (label, hours) for whichever stage ate the most
+    time, or (None, 0) if nothing in any blocker stage this month."""
+    best_key, best_hours = None, 0.0
+    for key, hours in total_hours.items():
+        if hours > best_hours:
+            best_key, best_hours = key, hours
+    if best_key is None:
+        return None, 0.0
+    return BLOCKER_LABELS[best_key], round(best_hours, 1)
+
+
 def aggregate_month(owner_id, owner_name, month_key):
     tickets = fetch_closed_tickets_for_owner_month(owner_id, month_key)
     tickets_closed = len(tickets)
     within_sla = 0
     within_sla_adjusted = 0
     eligible_for_adjusted = 0
+    blocker_totals = {key: 0.0 for key in BLOCKER_STAGE_FIELDS}
 
     for t in tickets:
         props = t.get("properties", {})
@@ -345,12 +409,20 @@ def aggregate_month(owner_id, owner_name, month_key):
             if met_adjusted:
                 within_sla_adjusted += 1
 
+        for key, hours in blocker_hours_for_ticket(props).items():
+            blocker_totals[key] += hours
+
+    blocker_label, blocker_hours = top_blocker(blocker_totals)
+
     return {
         "owner_name": owner_name,
         "tickets_closed": tickets_closed,
         "within_sla": within_sla,
         "eligible_for_adjusted": eligible_for_adjusted,
         "within_sla_adjusted": within_sla_adjusted,
+        "blocker_totals": blocker_totals,
+        "top_blocker": blocker_label,
+        "top_blocker_hours": blocker_hours,
     }
 
 
@@ -389,6 +461,14 @@ def upsert_sla_row(month_key, scope, agg, status):
         "eligible_for_adjusted": agg["eligible_for_adjusted"],
         "within_sla_adjusted": agg["within_sla_adjusted"],
         "sla_pct_adjusted": sla_pct_adjusted,
+        "top_blocker": agg["top_blocker"],
+        "top_blocker_hours": agg["top_blocker_hours"],
+        "tech_hours": round(agg["blocker_totals"]["tech"], 1),
+        "finance_hours": round(agg["blocker_totals"]["finance"], 1),
+        "media_brand_hours": round(agg["blocker_totals"]["media_brand"], 1),
+        "innova_hours": round(agg["blocker_totals"]["innova"], 1),
+        "cs_feedback_hours": round(agg["blocker_totals"]["cs_feedback"], 1),
+        "hotel_client_hours": round(agg["blocker_totals"]["hotel_client"], 1),
         "status": status,
         "updated_at": dt.datetime.utcnow().isoformat(),
     }
@@ -441,7 +521,8 @@ def run_monthly_sla(force_months=None, dry_run=False):
             continue  # locked
 
         status = "current" if month_key == current_month_key else "closed"
-        team_agg = {"tickets_closed": 0, "within_sla": 0, "eligible_for_adjusted": 0, "within_sla_adjusted": 0}
+        team_scalars = {"tickets_closed": 0, "within_sla": 0, "eligible_for_adjusted": 0, "within_sla_adjusted": 0}
+        team_blocker_totals = {key: 0.0 for key in BLOCKER_STAGE_FIELDS}
 
         for owner_id, owner_name in OWNERS.items():
             agg = aggregate_month(owner_id, owner_name, month_key)
@@ -449,8 +530,23 @@ def run_monthly_sla(force_months=None, dry_run=False):
                 print(f"[DRY RUN] {month_key} / {owner_name} ({status}): {agg}")
             else:
                 upsert_sla_row(month_key, owner_name, agg, status)
-            for key in team_agg:
-                team_agg[key] += agg[key]
+            for key in team_scalars:
+                team_scalars[key] += agg[key]
+            for key in team_blocker_totals:
+                team_blocker_totals[key] += agg["blocker_totals"][key]
+
+        # Team's top blocker is recomputed from the SUMMED totals, not
+        # derived from the three owners' individual top blockers - e.g.
+        # if Javiana's top is Tech and Lucas's top is Innova, the team's
+        # top could legitimately be either one, or something else
+        # entirely once all three are added together.
+        team_blocker_label, team_blocker_hours = top_blocker(team_blocker_totals)
+        team_agg = {
+            **team_scalars,
+            "blocker_totals": team_blocker_totals,
+            "top_blocker": team_blocker_label,
+            "top_blocker_hours": team_blocker_hours,
+        }
 
         if dry_run:
             print(f"[DRY RUN] {month_key} / team ({status}): {team_agg}")
