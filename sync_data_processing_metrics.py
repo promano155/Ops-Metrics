@@ -11,16 +11,23 @@ Run daily via GitHub Actions (see data-processing-sync.yml).
 --- Design notes / assumptions (confirm these match reality before trusting numbers) ---
 1. "Eligible files" = rows where the Data Uploaded flag is Yes/TRUE AND an
    Upload Date is present.
-2. "Sent within 7 business days" = eligible rows with a Send Date on or
-   before a FIXED cutoff: the 7th business day of the REPORTING month
-   (the month the actual processing work happens in - see point 6),
-   counting that month's 1st business day as day 1. This is NOT a
-   rolling per-row clock that starts on each file's own Upload Date -
-   confirmed 2026-08-25. Every file in the cohort is held to the same
-   deadline regardless of which day within the month it was uploaded:
-   a file uploaded on the month's 1st business day and one uploaded on
-   the 15th both had to be sent by the SAME cutoff date. Business days
-   = Mon-Fri, no holiday calendar applied.
+2. "Sent within 7 business days" = rows where the Results Sent flag is
+   Yes/TRUE AND the Send Date falls on/after the 1st and on/before the
+   7th business day of the REPORTING month (the month the actual
+   processing work happens in - see point 6), counting that month's 1st
+   business day as day 1. This is a FIXED cutoff for the whole cohort,
+   not a rolling per-row clock starting on each file's own Upload Date -
+   confirmed 2026-08-25. It is also deliberately INDEPENDENT of the
+   Data Uploaded flag and Upload Date (i.e. independent of "eligible
+   files" below) - confirmed 2026-08-25: those get left unchecked/blank
+   sometimes even when a file genuinely was uploaded and sent on time,
+   and that shouldn't suppress a real on-time send from counting. This
+   means sent_within_sla is NOT guaranteed to be a subset of
+   eligible_files, and rate_pct (sent_within_sla / eligible_files) can
+   in principle exceed 100% if sheet data is incomplete elsewhere -
+   that's a visible symptom worth investigating in the sheet, not a
+   bug in this calculation. Business days = Mon-Fri, no holiday
+   calendar applied.
 3. "Total files sent" (previous-month closed card) = count of rows in that
    month where the Results Sent flag is Yes/TRUE, regardless of how long it
    took. This is a different, broader number than "sent within 7 days."
@@ -232,13 +239,17 @@ def shift_month_key(month_key, n):
 def extract_month_aggregates(spreadsheet, months_wanted):
     aggs = {mk: MonthAgg() for mk in months_wanted}
 
-    # One fixed SLA cutoff per billing period, computed against the
+    # One fixed SLA window per billing period, computed against the
     # REPORT month's calendar (where the actual upload/send dates live),
-    # not the billing period's own month.
+    # not the billing period's own month. window_start guards against a
+    # garbled/mis-parsed date accidentally landing before the month even
+    # starts and still passing a "<= cutoff" check.
     cutoffs = {}
+    window_starts = {}
     for billing_period in months_wanted:
         report_year, report_month = (int(x) for x in shift_month_key(billing_period, 1).split("-"))
         cutoffs[billing_period] = nth_business_day_of_month(report_year, report_month, BUSINESS_DAY_SLA)
+        window_starts[billing_period] = dt.date(report_year, report_month, 1)
 
     for ws in spreadsheet.worksheets():
         try:
@@ -280,9 +291,20 @@ def extract_month_aggregates(spreadsheet, months_wanted):
 
             if uploaded_flag and upload_date:
                 agg.eligible_files += 1
-                if sent_flag and send_date:
-                    if send_date <= cutoffs[month_key]:
-                        agg.sent_within_sla += 1
+
+            # Confirmed 2026-08-25: "sent within 7 business days" depends
+            # ONLY on the Results Sent? flag being true and the Send Date
+            # falling in the window - NOT on the Data Uploaded flag or
+            # Upload Date. Those get forgotten/left unchecked sometimes
+            # even when a file genuinely was uploaded and sent on time,
+            # and that human slip shouldn't suppress an on-time send from
+            # counting. This is deliberately independent of eligible_files
+            # (which still gates the "eligible files" denominator per
+            # design note #1) - sent_within_sla can now, in principle,
+            # include rows eligible_files doesn't, so rate_pct is not a
+            # strict "numerator is a subset of denominator" percentage.
+            if sent_flag and send_date and window_starts[month_key] <= send_date <= cutoffs[month_key]:
+                agg.sent_within_sla += 1
 
             if sent_flag:
                 agg.total_files_sent += 1
@@ -309,8 +331,15 @@ def list_rows_for_billing_period(spreadsheet, target_billing_period):
     Billing Period Analyzed VALUE, not by which tab it's on."""
     report_year, report_month = (int(x) for x in shift_month_key(target_billing_period, 1).split("-"))
     cutoff = nth_business_day_of_month(report_year, report_month, BUSINESS_DAY_SLA)
+    window_start = dt.date(report_year, report_month, 1)
 
     records = []
+    raw_send_date_in_window = []  # ANY row with a Send Date parsing into
+                                   # [window_start, cutoff], regardless of
+                                   # eligibility or the Results Sent? flag -
+                                   # matches a pure "count rows where Send
+                                   # Date falls in this range" manual read
+                                   # of the sheet.
     for ws in spreadsheet.worksheets():
         try:
             values = get_all_values_with_retry(ws)
@@ -348,7 +377,12 @@ def list_rows_for_billing_period(spreadsheet, target_billing_period):
             send_date = parse_date(row[col_send_date], year)
 
             eligible = bool(uploaded_flag and upload_date)
-            within_sla = eligible and sent_flag and send_date is not None and send_date <= cutoff
+            sent_in_window = sent_flag and send_date is not None and window_start <= send_date <= cutoff
+            # Matches production exactly now: sent_in_window IS within_sla.
+            # Eligibility no longer gates the numerator - kept here only
+            # as informational context (e.g. to spot a forgotten Data
+            # Uploaded checkbox), never as a reason something doesn't count.
+            within_sla = sent_in_window
 
             records.append({
                 "sheet_title": ws.title,
@@ -356,27 +390,51 @@ def list_rows_for_billing_period(spreadsheet, target_billing_period):
                 "hotel_name": hotel_name,
                 "upload_date_raw": row[col_upload_date] if len(row) > col_upload_date else "",
                 "upload_date_parsed": upload_date.isoformat() if upload_date else None,
+                "uploaded_flag_raw": row[col_uploaded] if (col_uploaded is not None and len(row) > col_uploaded) else "",
                 "send_date_raw": row[col_send_date] if len(row) > col_send_date else "",
                 "send_date_parsed": send_date.isoformat() if send_date else None,
                 "eligible": eligible,
                 "counted_within_sla": within_sla,
             })
 
-    return records, cutoff
+            if send_date is not None and window_start <= send_date <= cutoff:
+                raw_send_date_in_window.append({
+                    "sheet_title": ws.title,
+                    "row_num": row_num,
+                    "hotel_name": hotel_name,
+                    "results_sent_flag_raw": row[col_sent_flag] if (col_sent_flag is not None and len(row) > col_sent_flag) else "",
+                    "send_date_raw": row[col_send_date] if len(row) > col_send_date else "",
+                    "send_date_parsed": send_date.isoformat(),
+                    "would_be_counted": within_sla,
+                })
+
+    return records, window_start, cutoff, raw_send_date_in_window
 
 
-def print_diagnostic_listing(records, cutoff):
+def print_diagnostic_listing(records, window_start, cutoff, raw_send_date_in_window):
     within_sla_records = [r for r in records if r["counted_within_sla"]]
-    print(f"\nSLA cutoff for this month: {cutoff.isoformat()} (fixed for the whole cohort, "
-          f"not per-row).")
+    missing_upload_info = [r for r in within_sla_records if not r["eligible"]]
+
+    print(f"\nSLA window for this month: {window_start.isoformat()} through {cutoff.isoformat()} "
+          f"(fixed for the whole cohort, not per-row).")
     print(f"{len(records)} total rows matched this billing period across all tabs.")
-    print(f"{len(within_sla_records)} currently counted as 'within 7 business days'.\n")
+    print(f"{len(within_sla_records)} counted as 'within 7 business days' "
+          f"(Results Sent? = true AND Send Date in window - Data Uploaded/Upload Date no longer "
+          f"required, per 2026-08-25).")
+    print(f"{len(raw_send_date_in_window)} rows have ANY Send Date value parsing into this window "
+          f"regardless of the Results Sent? flag - should equal the above count plus any rows "
+          f"where the Send Date is filled in but Results Sent? was left unchecked.\n")
 
     print("--- Rows counted as within SLA ---")
     for r in within_sla_records:
+        flag_note = "" if r["eligible"] else "  [Data Uploaded/Upload Date missing - informational only, does not affect count]"
         print(f"  [{r['sheet_title']} row {r['row_num']}] {r['hotel_name']}: "
               f"uploaded {r['upload_date_raw']!r} -> {r['upload_date_parsed']}, "
-              f"sent {r['send_date_raw']!r} -> {r['send_date_parsed']}")
+              f"sent {r['send_date_raw']!r} -> {r['send_date_parsed']}{flag_note}")
+
+    if missing_upload_info:
+        print(f"\n{len(missing_upload_info)} of the above rows are missing Data Uploaded/Upload "
+              f"Date info - worth a sheet cleanup pass, but not excluded from the count.")
 
     # Duplicate detection: same hotel + same parsed send date appearing
     # on more than one sheet tab under this billing period - a real
@@ -503,7 +561,7 @@ if __name__ == "__main__":
     if args.list_rows:
         gc = get_gspread_client()
         spreadsheet = gc.open_by_key(SHEET_ID)
-        records, cutoff = list_rows_for_billing_period(spreadsheet, args.list_rows)
-        print_diagnostic_listing(records, cutoff)
+        records, window_start, cutoff, raw_send_date_in_window = list_rows_for_billing_period(spreadsheet, args.list_rows)
+        print_diagnostic_listing(records, window_start, cutoff, raw_send_date_in_window)
     else:
         main(force_months=args.month, dry_run=args.dry_run)
