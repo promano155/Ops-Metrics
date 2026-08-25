@@ -8,7 +8,7 @@ on:
         required: true
         default: "true"
       force_month:
-        description: "Optional: force-recompute one closed month, e.g. 2026-07. Leave blank to skip."
+        description: "Optional: force-recompute closed month(s), e.g. 2026-07 or 2026-01,2026-02,2026-03. Leave blank to skip."
         required: false
         default: ""
 
@@ -34,7 +34,10 @@ jobs:
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
           fi
-          if [ -n "${{ github.event.inputs.force_month }}" ]; then
-            ARGS="$ARGS --month ${{ github.event.inputs.force_month }}"
+          RAW_MONTHS="${{ github.event.inputs.force_month }}"
+          if [ -n "$RAW_MONTHS" ]; then
+            for MONTH in $(echo "$RAW_MONTHS" | tr ',' ' '); do
+              ARGS="$ARGS --month $MONTH"
+            done
           fi
           python sync_hubspot_ticket_sla.py $ARGS
