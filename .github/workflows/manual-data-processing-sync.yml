@@ -11,6 +11,10 @@ on:
         description: "Optional: force-recompute closed REPORTING month(s), e.g. 2026-08 or 2026-01,2026-02. Leave blank to skip."
         required: false
         default: ""
+      list_rows:
+        description: "Diagnostic only: BILLING PERIOD to list every row for (e.g. 2026-07 for August's reporting month). Leave blank for a normal run. Overrides dry_run/force_month when set - read-only, no writes."
+        required: false
+        default: ""
 
 jobs:
   run:
@@ -30,6 +34,12 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
+          LIST_ROWS="${{ github.event.inputs.list_rows }}"
+          if [ -n "$LIST_ROWS" ]; then
+            python sync_data_processing_metrics.py --list-rows "$LIST_ROWS"
+            exit 0
+          fi
+
           ARGS=""
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
