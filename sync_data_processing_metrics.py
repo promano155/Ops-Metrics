@@ -77,6 +77,7 @@ MONTH_OFFSET = 1
 
 COLUMN_ALIASES = {
     "billing_period": ["Billing Period Analyzed", "Period Being Analyzed"],
+    "hotel_name": ["Hotel Name", "Hotel"],
     "data_uploaded_flag": ["Data Uploaded (Yes/No)", "Data Uploaded"],
     "upload_date": ["Upload Date"],
     "results_sent_flag": [
@@ -263,6 +264,108 @@ def extract_month_aggregates(spreadsheet, months_wanted):
     return aggs
 
 
+def list_rows_for_billing_period(spreadsheet, target_billing_period):
+    """Read-only diagnostic - makes NO Supabase calls. Walks every
+    worksheet the same way extract_month_aggregates does, but instead of
+    only tallying counts, returns one record per row whose Billing
+    Period Analyzed matches target_billing_period, showing exactly which
+    sheet tab it came from, its hotel name, upload/send dates, computed
+    elapsed business days, and whether it counted as eligible / within
+    SLA. Built specifically to let a human compare against known-correct
+    numbers and point at the exact rows causing a discrepancy, rather
+    than guessing at the cause from aggregate counts alone.
+
+    Also flags duplicate (sheet-independent) hotel+date combinations
+    that appear on MORE than one worksheet tab under the same billing
+    period label - a real way overcounting can happen, since this
+    script (by design, to survive tab-naming drift) buckets by the
+    Billing Period Analyzed VALUE, not by which tab it's on."""
+    records = []
+    for ws in spreadsheet.worksheets():
+        try:
+            values = get_all_values_with_retry(ws)
+        except Exception as e:
+            print(f"SKIPPING worksheet '{ws.title}' after retries failed: {e}")
+            continue
+        if not values:
+            continue
+
+        headers = values[0]
+        col_period = find_col_index(headers, "billing_period")
+        col_hotel = find_col_index(headers, "hotel_name")
+        col_uploaded = find_col_index(headers, "data_uploaded_flag")
+        col_upload_date = find_col_index(headers, "upload_date")
+        col_sent_flag = find_col_index(headers, "results_sent_flag")
+        col_send_date = find_col_index(headers, "send_date")
+
+        if col_period is None or col_upload_date is None or col_send_date is None:
+            continue
+
+        for row_num, row in enumerate(values[1:], start=2):
+            if len(row) <= max(col_period, col_upload_date, col_send_date):
+                continue
+            parsed_period = parse_billing_period(row[col_period])
+            if not parsed_period:
+                continue
+            month_key, year = parsed_period
+            if month_key != target_billing_period:
+                continue
+
+            hotel_name = row[col_hotel].strip() if (col_hotel is not None and len(row) > col_hotel) else "(no hotel name column)"
+            uploaded_flag = is_truthy(row[col_uploaded]) if col_uploaded is not None else bool(row[col_upload_date])
+            upload_date = parse_date(row[col_upload_date], year)
+            sent_flag = is_truthy(row[col_sent_flag]) if col_sent_flag is not None else bool(row[col_send_date])
+            send_date = parse_date(row[col_send_date], year)
+
+            eligible = bool(uploaded_flag and upload_date)
+            elapsed = business_days_elapsed(upload_date, send_date) if (sent_flag and send_date) else None
+            within_sla = eligible and elapsed is not None and elapsed <= BUSINESS_DAY_SLA
+
+            records.append({
+                "sheet_title": ws.title,
+                "row_num": row_num,
+                "hotel_name": hotel_name,
+                "upload_date_raw": row[col_upload_date] if len(row) > col_upload_date else "",
+                "upload_date_parsed": upload_date.isoformat() if upload_date else None,
+                "send_date_raw": row[col_send_date] if len(row) > col_send_date else "",
+                "send_date_parsed": send_date.isoformat() if send_date else None,
+                "elapsed_business_days": elapsed,
+                "eligible": eligible,
+                "counted_within_sla": within_sla,
+            })
+
+    return records
+
+
+def print_diagnostic_listing(records):
+    within_sla_records = [r for r in records if r["counted_within_sla"]]
+    print(f"\n{len(records)} total rows matched this billing period across all tabs.")
+    print(f"{len(within_sla_records)} currently counted as 'within 7 business days'.\n")
+
+    print("--- Rows counted as within SLA ---")
+    for r in within_sla_records:
+        print(f"  [{r['sheet_title']} row {r['row_num']}] {r['hotel_name']}: "
+              f"uploaded {r['upload_date_raw']!r} -> {r['upload_date_parsed']}, "
+              f"sent {r['send_date_raw']!r} -> {r['send_date_parsed']}, "
+              f"elapsed={r['elapsed_business_days']}bd")
+
+    # Duplicate detection: same hotel + same parsed send date appearing
+    # on more than one sheet tab under this billing period - a real
+    # mechanism for overcounting given this script buckets by billing
+    # period VALUE, not by tab.
+    seen = {}
+    for r in within_sla_records:
+        key = (r["hotel_name"], r["send_date_parsed"])
+        seen.setdefault(key, []).append(r["sheet_title"])
+    dupes = {k: v for k, v in seen.items() if len(v) > 1}
+    if dupes:
+        print("\n--- Possible duplicates (same hotel + send date on multiple tabs) ---")
+        for (hotel, send_date), tabs in dupes.items():
+            print(f"  {hotel} sent {send_date}: appears on tabs {tabs}")
+    else:
+        print("\nNo same-hotel-and-send-date duplicates found across tabs.")
+
+
 # ---------------------------------------------------------------------------
 # Supabase
 # ---------------------------------------------------------------------------
@@ -368,6 +471,17 @@ if __name__ == "__main__":
     parser.add_argument("--month", type=str, action="append", default=None,
                          help="Force-recompute a specific already-closed REPORTING month "
                               "(e.g. 2026-08). Repeatable.")
+    parser.add_argument("--list-rows", type=str, default=None,
+                         help="Diagnostic, read-only: list every row matching this BILLING "
+                              "PERIOD (e.g. 2026-07, not the reporting month) across every "
+                              "tab, showing what counted and why. No Supabase calls at all "
+                              "in this mode - it doesn't even read the existing table.")
     args = parser.parse_args()
 
-    main(force_months=args.month, dry_run=args.dry_run)
+    if args.list_rows:
+        gc = get_gspread_client()
+        spreadsheet = gc.open_by_key(SHEET_ID)
+        records = list_rows_for_billing_period(spreadsheet, args.list_rows)
+        print_diagnostic_listing(records)
+    else:
+        main(force_months=args.month, dry_run=args.dry_run)
