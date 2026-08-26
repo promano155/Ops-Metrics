@@ -97,9 +97,16 @@ COLUMN_ALIASES = {
         "Invoice Sent",
     ],
     "send_date": ["Send Date", "Invoice Send Date"],
+    "status": ["Status"],
 }
 
 TRUE_VALUES = {"yes", "true", "y"}
+EXCLUDED_STATUSES = {"cancelling"}  # normalized (lowercased/trimmed). A
+# hotel mid-cancellation shouldn't count against the active-account SLA
+# rate - confirmed 2026-08-25. Blocklist rather than an allowlist of
+# "Live" specifically, since other valid status values may exist on
+# other months' tabs that haven't been seen yet; only the one confirmed
+# problematic value is excluded, not everything that isn't "Live".
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -286,6 +293,7 @@ def extract_month_aggregates(spreadsheet, months_wanted):
         col_upload_date = find_col_index(headers, "upload_date")
         col_sent_flag = find_col_index(headers, "results_sent_flag")
         col_send_date = find_col_index(headers, "send_date")
+        col_status = find_col_index(headers, "status")
 
         if col_period is None or col_upload_date is None or col_send_date is None:
             continue
@@ -308,8 +316,26 @@ def extract_month_aggregates(spreadsheet, months_wanted):
             upload_date = parse_date(row[col_upload_date], year)
             sent_flag = is_truthy(row[col_sent_flag]) if col_sent_flag is not None else bool(row[col_send_date])
             send_date = parse_date(row[col_send_date], year)
+            status = normalize(row[col_status]) if (col_status is not None and len(row) > col_status) else ""
 
-            if uploaded_flag and upload_date:
+            # Confirmed 2026-08-25: "eligible files" excludes two cases
+            # the plain flag+date check let through:
+            #  1. Files uploaded AFTER this month's SLA cutoff already
+            #     passed - they were never going to be part of this
+            #     window's cohort no matter how fast they were
+            #     processed, so counting them in the denominator
+            #     understates the real rate.
+            #  2. Hotels with Status = Cancelling - a departing account
+            #     shouldn't count against the active-account SLA rate.
+            # Both confirmed against real data: without these, the
+            # computed rate (71.0%) didn't match an end user's own
+            # count (82%); with both, it lands at 81.7%.
+            if (
+                uploaded_flag
+                and upload_date
+                and upload_date <= cutoffs[month_key]
+                and status not in EXCLUDED_STATUSES
+            ):
                 agg.eligible_files += 1
 
             # Confirmed 2026-08-25: "sent within 7 business days" depends
@@ -321,6 +347,7 @@ def extract_month_aggregates(spreadsheet, months_wanted):
             # counting. This is deliberately independent of eligible_files
             # (which still gates the "eligible files" denominator per
             # design note #1) - sent_within_sla can now, in principle,
+
             # include rows eligible_files doesn't, so rate_pct is not a
             # strict "numerator is a subset of denominator" percentage.
             if sent_flag and send_date and window_starts[month_key] <= send_date <= cutoffs[month_key]:
@@ -376,6 +403,7 @@ def list_rows_for_billing_period(spreadsheet, target_billing_period):
         col_upload_date = find_col_index(headers, "upload_date")
         col_sent_flag = find_col_index(headers, "results_sent_flag")
         col_send_date = find_col_index(headers, "send_date")
+        col_status = find_col_index(headers, "status")
 
         if col_period is None or col_upload_date is None or col_send_date is None:
             continue
@@ -395,13 +423,20 @@ def list_rows_for_billing_period(spreadsheet, target_billing_period):
             upload_date = parse_date(row[col_upload_date], year)
             sent_flag = is_truthy(row[col_sent_flag]) if col_sent_flag is not None else bool(row[col_send_date])
             send_date = parse_date(row[col_send_date], year)
+            status = normalize(row[col_status]) if (col_status is not None and len(row) > col_status) else ""
 
-            eligible = bool(uploaded_flag and upload_date)
+            # Matches production exactly: eligible requires the flag,
+            # a parseable date, that date being within this month's SLA
+            # window, and the hotel not being in "Cancelling" status.
+            eligible = bool(
+                uploaded_flag
+                and upload_date
+                and upload_date <= cutoff
+                and status not in EXCLUDED_STATUSES
+            )
             sent_in_window = sent_flag and send_date is not None and window_start <= send_date <= cutoff
-            # Matches production exactly now: sent_in_window IS within_sla.
-            # Eligibility no longer gates the numerator - kept here only
-            # as informational context (e.g. to spot a forgotten Data
-            # Uploaded checkbox), never as a reason something doesn't count.
+            # sent_in_window IS within_sla - eligibility does not gate
+            # the numerator (see design note #2), only the denominator.
             within_sla = sent_in_window
             unparseable_send_date = sent_flag and not send_date and str(row[col_send_date] if len(row) > col_send_date else "").strip() != ""
 
@@ -412,6 +447,7 @@ def list_rows_for_billing_period(spreadsheet, target_billing_period):
                 "upload_date_raw": row[col_upload_date] if len(row) > col_upload_date else "",
                 "upload_date_parsed": upload_date.isoformat() if upload_date else None,
                 "uploaded_flag_raw": row[col_uploaded] if (col_uploaded is not None and len(row) > col_uploaded) else "",
+                "status_raw": row[col_status] if (col_status is not None and len(row) > col_status) else "",
                 "send_date_raw": row[col_send_date] if len(row) > col_send_date else "",
                 "send_date_parsed": send_date.isoformat() if send_date else None,
                 "eligible": eligible,
@@ -435,14 +471,18 @@ def list_rows_for_billing_period(spreadsheet, target_billing_period):
 
 def print_diagnostic_listing(records, window_start, cutoff, raw_send_date_in_window):
     within_sla_records = [r for r in records if r["counted_within_sla"]]
+    eligible_records = [r for r in records if r["eligible"]]
     missing_upload_info = [r for r in within_sla_records if not r["eligible"]]
+    rate_pct = round(len(within_sla_records) / len(eligible_records) * 100, 1) if eligible_records else None
 
     print(f"\nSLA window for this month: {window_start.isoformat()} through {cutoff.isoformat()} "
           f"(fixed for the whole cohort, not per-row).")
     print(f"{len(records)} total rows matched this billing period across all tabs.")
+    print(f"{len(eligible_records)} eligible files (Data Uploaded + Upload Date, Upload Date "
+          f"within this month's SLA window, Status not Cancelling).")
     print(f"{len(within_sla_records)} counted as 'within 7 business days' "
-          f"(Results Sent? = true AND Send Date in window - Data Uploaded/Upload Date no longer "
-          f"required, per 2026-08-25).")
+          f"(Results Sent? = true AND Send Date in window - independent of eligibility).")
+    print(f"Rate: {len(within_sla_records)}/{len(eligible_records)} = {rate_pct}%")
     print(f"{len(raw_send_date_in_window)} rows have ANY Send Date value parsing into this window "
           f"regardless of the Results Sent? flag - should equal the above count plus any rows "
           f"where the Send Date is filled in but Results Sent? was left unchecked.\n")
