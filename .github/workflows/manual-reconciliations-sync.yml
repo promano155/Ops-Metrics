@@ -1,0 +1,43 @@
+name: manual-reconciliations-sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (no Supabase writes) - true or false"
+        required: true
+        default: "true"
+      force_month:
+        description: "Optional: force-recompute closed month(s), e.g. 2026-07 or 2026-01,2026-02. Leave blank to skip."
+        required: false
+        default: ""
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Run sync
+        env:
+          HUBSPOT_PRIVATE_APP_TOKEN: ${{ secrets.HUBSPOT_PRIVATE_APP_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          RAW_MONTHS="${{ github.event.inputs.force_month }}"
+          if [ -n "$RAW_MONTHS" ]; then
+            for MONTH in $(echo "$RAW_MONTHS" | tr ',' ' '); do
+              ARGS="$ARGS --month $MONTH"
+            done
+          fi
+          python sync_hubspot_reconciliations_monthly.py $ARGS
