@@ -88,7 +88,13 @@ STAGE_COMPLETED = "964383047"
 STAGE_CONTENT_REJECTED = "1062225450"
 
 BACKLOG_TABLE = "hubspot_reconciliations_backlog"
+BACKLOG_DETAIL_TABLE = "hubspot_reconciliations_backlog_detail"
 PAGE_SIZE = 100
+
+# Confirmed live via search_crm_objects, 2026-08-26 - HubSpot's own
+# returned urlTemplate for TICKET objects in this portal.
+HUBSPOT_PORTAL_ID = "43582448"
+TICKET_URL_TEMPLATE = f"https://app.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/record/0-5/{{id}}"
 
 TRAILING_MONTHS = 24
 
@@ -209,32 +215,57 @@ def fetch_open_reconciliation_tickets():
              "values": [STAGE_COMPLETED, STAGE_CONTENT_REJECTED]},
         ]
     }]
-    return fetch_all_tickets(filter_groups, ["createdate"])
+    return fetch_all_tickets(filter_groups, ["createdate", "subject"])
 
 
 def bucket_by_age(tickets, as_of=None):
     """Buckets open tickets by days since createdate: 0-30, 31-60,
     61-90, 90+. A ticket missing createdate entirely (shouldn't happen,
     but data drifts) is counted separately as 'unmapped' rather than
-    silently dropped or guessed into a bucket."""
+    silently dropped or guessed into a bucket.
+
+    Returns (counts, detail_rows) - counts feeds the aggregate snapshot
+    card, detail_rows feeds the per-bucket drill-down dropdown (hotel/
+    subject, exact age, and a direct link to the ticket in HubSpot)."""
     as_of = as_of or dt.date.today()
-    buckets = {"0_30": 0, "31_60": 0, "61_90": 0, "90_plus": 0, "unmapped": 0}
+    counts = {"0_30": 0, "31_60": 0, "61_90": 0, "90_plus": 0, "unmapped": 0}
+    detail_rows = []
+
     for t in tickets:
-        created_ms = parse_hubspot_epoch_ms(t.get("properties", {}).get("createdate"))
+        props = t.get("properties", {})
+        ticket_id = t.get("id")
+        subject = props.get("subject") or "(no subject)"
+        created_ms = parse_hubspot_epoch_ms(props.get("createdate"))
+
         if created_ms is None:
-            buckets["unmapped"] += 1
-            continue
-        created_date = dt.datetime.utcfromtimestamp(created_ms / 1000).date()
-        age_days = (as_of - created_date).days
-        if age_days <= 30:
-            buckets["0_30"] += 1
-        elif age_days <= 60:
-            buckets["31_60"] += 1
-        elif age_days <= 90:
-            buckets["61_90"] += 1
+            counts["unmapped"] += 1
+            bucket = "unmapped"
+            age_days = None
+            created_date = None
         else:
-            buckets["90_plus"] += 1
-    return buckets
+            created_date = dt.datetime.utcfromtimestamp(created_ms / 1000).date()
+            age_days = (as_of - created_date).days
+            if age_days <= 30:
+                bucket = "0_30"
+            elif age_days <= 60:
+                bucket = "31_60"
+            elif age_days <= 90:
+                bucket = "61_90"
+            else:
+                bucket = "90_plus"
+            counts[bucket] += 1
+
+        detail_rows.append({
+            "ticket_id": str(ticket_id),
+            "subject": subject,
+            "created_date": created_date.isoformat() if created_date else None,
+            "age_days": age_days,
+            "bucket": bucket,
+            "url": TICKET_URL_TEMPLATE.format(id=ticket_id),
+            "updated_at": dt.datetime.utcnow().isoformat(),
+        })
+
+    return counts, detail_rows
 
 
 def upsert_backlog_snapshot(buckets, dry_run=False):
@@ -260,6 +291,33 @@ def upsert_backlog_snapshot(buckets, dry_run=False):
     )
     resp.raise_for_status()
     print(f"Upserted backlog snapshot: {payload}")
+
+
+def replace_backlog_detail_rows(detail_rows, dry_run=False):
+    """Full replace, not upsert-by-key - a ticket that closed since the
+    last run needs to actually disappear from this table, not just stop
+    being updated. Simplest correct way to do that with a live snapshot
+    of an ever-changing open set: clear everything, then insert the
+    current set fresh. Same 'always fully overwritten, no history kept'
+    philosophy as the aggregate snapshot table."""
+    if dry_run:
+        print(f"[DRY RUN] Would replace {BACKLOG_DETAIL_TABLE} with {len(detail_rows)} rows. Sample:")
+        for row in detail_rows[:5]:
+            print(f"  {row}")
+        return
+
+    delete_url = f"{SUPABASE_URL}/rest/v1/{BACKLOG_DETAIL_TABLE}"
+    resp = requests.delete(delete_url, headers=supabase_headers(), params={"ticket_id": "not.is.null"}, timeout=30)
+    resp.raise_for_status()
+
+    if not detail_rows:
+        print("Backlog detail table cleared - no open reconciliation tickets right now.")
+        return
+
+    insert_url = f"{SUPABASE_URL}/rest/v1/{BACKLOG_DETAIL_TABLE}"
+    resp = requests.post(insert_url, headers=supabase_headers(), json=detail_rows, timeout=30)
+    resp.raise_for_status()
+    print(f"Replaced {BACKLOG_DETAIL_TABLE} with {len(detail_rows)} rows.")
 
 
 # ---------------------------------------------------------------------------
@@ -321,8 +379,9 @@ def month_key_n_back(n):
 
 def run_backlog_snapshot(dry_run=False):
     tickets = fetch_open_reconciliation_tickets()
-    buckets = bucket_by_age(tickets)
-    upsert_backlog_snapshot(buckets, dry_run=dry_run)
+    counts, detail_rows = bucket_by_age(tickets)
+    upsert_backlog_snapshot(counts, dry_run=dry_run)
+    replace_backlog_detail_rows(detail_rows, dry_run=dry_run)
 
 
 def main(force_months=None, dry_run=False):
