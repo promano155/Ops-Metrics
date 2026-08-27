@@ -67,10 +67,10 @@ TABLE = "reports_sent_monthly"
 
 TRAILING_MONTHS = 24
 
-COLUMN_PREFIXES = {
-    "sent_to_hotel": "sent to hotel",
-    "send_date": "send date",
-    "hotel": "hotel",
+COLUMN_ALIASES = {
+    "sent_to_hotel": ["sent to hotel"],
+    "send_date": ["send date", "date sent"],
+    "hotel": ["hotel"],
 }
 
 # ---------------------------------------------------------------------------
@@ -82,11 +82,12 @@ def normalize(s):
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
 
-def find_col_index(headers, prefix_key):
-    prefix = COLUMN_PREFIXES[prefix_key]
-    for i, h in enumerate(headers):
-        if normalize(h).startswith(prefix):
-            return i
+def find_col_index(headers, alias_key):
+    normalized_headers = [normalize(h) for h in headers]
+    for alias in COLUMN_ALIASES[alias_key]:
+        for i, h in enumerate(normalized_headers):
+            if h.startswith(alias):
+                return i
     return None
 
 
@@ -169,13 +170,17 @@ def extract_reports_sent_by_month(spreadsheet, months_wanted):
 
         tab_true_count = 0
         tab_matched_count = 0
+        sample_raw_dates = []
         for row in values[1:]:
             if len(row) <= max(col_sent, col_date):
                 continue
             if not is_truthy(row[col_sent]):
                 continue
             tab_true_count += 1
-            send_date = parse_cell_date(row[col_date])
+            raw_date = row[col_date]
+            if len(sample_raw_dates) < 5:
+                sample_raw_dates.append(repr(raw_date))
+            send_date = parse_cell_date(raw_date)
             if send_date is None:
                 continue
             month_key = f"{send_date.year:04d}-{send_date.month:02d}"
@@ -185,7 +190,7 @@ def extract_reports_sent_by_month(spreadsheet, months_wanted):
 
         print(f"'{ws.title}': found columns OK (sent=col {col_sent}, date=col {col_date}). "
               f"{tab_true_count} rows with Sent to Hotel=True, {tab_matched_count} of those "
-              f"parsed into a wanted month.")
+              f"parsed into a wanted month. Sample raw date values: {sample_raw_dates}")
 
     return counts
 
