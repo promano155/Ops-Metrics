@@ -65,7 +65,10 @@ SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 TABLE = "reports_sent_monthly"
 
-TRAILING_MONTHS = 24
+TRAILING_MONTHS = 14  # usable data starts June 2025 - older tabs lack the
+                       # needed columns entirely and always fail column
+                       # detection, so there's no point requesting/scanning
+                       # further back than that
 
 COLUMN_ALIASES = {
     "sent_to_hotel": ["sent to hotel"],
@@ -121,11 +124,43 @@ def get_all_values_with_retry(ws):
     raise RuntimeError(f"Still rate limited reading '{ws.title}' after {SHEETS_MAX_RETRIES} retries")
 
 
-def parse_cell_date(raw):
-    """get_all_values() returns display strings, not typed dates -
-    matching the pattern already used in sync_data_processing_metrics.py's
-    parse_date(), since these sheets show dates the same loose way
-    (M/D, M/D/YY, M/D/YYYY)."""
+MONTH_NAME_RE = re.compile(
+    r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})",
+    re.IGNORECASE,
+)
+MONTH_NUMBER = {name: i for i, name in enumerate(
+    ["January", "February", "March", "April", "May", "June", "July",
+     "August", "September", "October", "November", "December"], start=1)}
+
+
+def tab_target_year_month(title):
+    """A tab named '{Month} {Year} Report List' covers work reported the
+    FOLLOWING calendar month - confirmed by the actual data: 'July 2026'
+    contains August send dates, and 'December 2025' contains JANUARY
+    dates (rolling into 2026, not staying in 2025). Returns
+    (target_year, target_month) - the year/month bare M/D dates in this
+    tab should be interpreted against - or None if the title doesn't
+    match the expected pattern (older/non-monthly tabs already get
+    filtered out by column detection before this matters)."""
+    match = MONTH_NAME_RE.search(title)
+    if not match:
+        return None
+    month_name, year_str = match.groups()
+    tab_month = MONTH_NUMBER[month_name.capitalize()]
+    tab_year = int(year_str)
+    if tab_month == 12:
+        return tab_year + 1, 1
+    return tab_year, tab_month + 1
+
+
+def parse_cell_date(raw, reference_year=None):
+    """get_all_values() returns display strings, not typed dates.
+    Confirmed live, 2026-08-27: every real value here is a BARE 'M/D'
+    with no year at all (e.g. '7/11', '8/11') - there is no year-
+    included format in practice, but the full-format attempts are kept
+    first as a defensive fallback in case that ever changes. reference_year
+    MUST be supplied by the caller for the bare-M/D case; see
+    tab_target_year_month() for how it's derived per tab."""
     if not raw or not str(raw).strip():
         return None
     raw = str(raw).strip()
@@ -134,6 +169,14 @@ def parse_cell_date(raw):
             return dt.datetime.strptime(raw, fmt).date()
         except ValueError:
             continue
+
+    m = re.match(r"^(\d{1,2})/(\d{1,2})$", raw)
+    if m and reference_year is not None:
+        month, day = int(m.group(1)), int(m.group(2))
+        try:
+            return dt.date(reference_year, month, day)
+        except ValueError:
+            return None
     return None
 
 
@@ -168,6 +211,13 @@ def extract_reports_sent_by_month(spreadsheet, months_wanted):
                   f"Headers seen: {headers}")
             continue
 
+        target = tab_target_year_month(ws.title)
+        reference_year = target[0] if target else None
+        if reference_year is None:
+            print(f"'{ws.title}': columns found but couldn't derive a reference year from the "
+                  f"tab title - bare M/D dates in this tab can't be parsed without one. Skipping.")
+            continue
+
         tab_true_count = 0
         tab_matched_count = 0
         sample_raw_dates = []
@@ -180,7 +230,7 @@ def extract_reports_sent_by_month(spreadsheet, months_wanted):
             raw_date = row[col_date]
             if len(sample_raw_dates) < 5:
                 sample_raw_dates.append(repr(raw_date))
-            send_date = parse_cell_date(raw_date)
+            send_date = parse_cell_date(raw_date, reference_year=reference_year)
             if send_date is None:
                 continue
             month_key = f"{send_date.year:04d}-{send_date.month:02d}"
