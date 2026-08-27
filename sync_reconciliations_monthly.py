@@ -138,6 +138,8 @@ def gmail_list_messages(access_token, query, page_token=None):
             print(f"Gmail rate limited, waiting {wait}s (attempt {attempt + 1}/{MAX_RETRIES})")
             time.sleep(wait)
             continue
+        if not resp.ok:
+            print(f"Gmail API error {resp.status_code} for query {query!r}: {resp.text}")
         resp.raise_for_status()
         time.sleep(REQUEST_DELAY_SECONDS)
         return resp.json()
@@ -177,6 +179,8 @@ def fetch_message_metadata(access_token, message_id):
             print(f"Gmail rate limited, waiting {wait}s (attempt {attempt + 1}/{MAX_RETRIES})")
             time.sleep(wait)
             continue
+        if not resp.ok:
+            print(f"Gmail API error {resp.status_code} fetching message {message_id}: {resp.text}")
         resp.raise_for_status()
         time.sleep(REQUEST_DELAY_SECONDS)
         body = resp.json()
