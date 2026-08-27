@@ -153,6 +153,7 @@ def extract_reports_sent_by_month(spreadsheet, months_wanted):
             print(f"SKIPPING worksheet '{ws.title}' after retries failed: {e}")
             continue
         if not values:
+            print(f"'{ws.title}': no values at all, skipping.")
             continue
 
         headers = values[0]
@@ -160,19 +161,31 @@ def extract_reports_sent_by_month(spreadsheet, months_wanted):
         col_date = find_col_index(headers, "send_date")
 
         if col_sent is None or col_date is None:
-            continue  # not a monthly report tab (e.g. a notes/summary tab)
+            print(f"'{ws.title}': column detection FAILED - "
+                  f"sent_to_hotel={'col ' + str(col_sent) if col_sent is not None else 'NOT FOUND'}, "
+                  f"send_date={'col ' + str(col_date) if col_date is not None else 'NOT FOUND'}. "
+                  f"Headers seen: {headers}")
+            continue
 
+        tab_true_count = 0
+        tab_matched_count = 0
         for row in values[1:]:
             if len(row) <= max(col_sent, col_date):
                 continue
             if not is_truthy(row[col_sent]):
                 continue
+            tab_true_count += 1
             send_date = parse_cell_date(row[col_date])
             if send_date is None:
                 continue
             month_key = f"{send_date.year:04d}-{send_date.month:02d}"
             if month_key in counts:
                 counts[month_key] += 1
+                tab_matched_count += 1
+
+        print(f"'{ws.title}': found columns OK (sent=col {col_sent}, date=col {col_date}). "
+              f"{tab_true_count} rows with Sent to Hotel=True, {tab_matched_count} of those "
+              f"parsed into a wanted month.")
 
     return counts
 
@@ -202,7 +215,7 @@ def upsert_month(month_key, reports_sent, status, dry_run=False):
         "month_key": month_key,
         "reports_sent": reports_sent,
         "status": status,
-        "updated_at": dt.datetime.utcnow().isoformat(),
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     if dry_run:
         print(f"[DRY RUN] Would upsert {month_key} ({status}): {payload}")
