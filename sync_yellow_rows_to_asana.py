@@ -78,6 +78,7 @@ import time
 import calendar
 import datetime as dt
 
+import gspread
 import requests
 from google.oauth2.service_account import Credentials
 
@@ -88,6 +89,19 @@ from google.oauth2.service_account import Credentials
 SHEET_ID = "10osrvx4zsemAQy3rAci2tbV3cAzRBSM8ocecbnuw76I"
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
+# The workbook has 90+ tabs (and growing). Reading each one with
+# get_all_values() in a tight loop can hit the Sheets API's per-minute
+# read quota - see sync_data_processing_metrics.py, which hit exactly
+# this and silently skipped most tabs, with only one making it into
+# Supabase. This script previously had no retry logic on that failure
+# at all: a single 429 partway through would skip every REMAINING
+# worksheet with no retry, including the current month's tab, which is
+# how a transient rate limit turned into a total "nothing to do" run.
+# Every read is now retried with backoff on rate-limit errors, matching
+# the fix already proven in sync_data_processing_metrics.py.
+SHEETS_REQUEST_DELAY_SECONDS = 1.1
+SHEETS_MAX_RETRIES = 5
 
 ASANA_TOKEN = os.environ["ASANA_PAT"]
 ASANA_PROJECT_GID = "1207448572741662"  # Data Processing Requests
@@ -133,6 +147,37 @@ COLUMN_ALIASES = {
 def get_credentials():
     creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     return Credentials.from_service_account_info(creds_dict, scopes=SHEETS_SCOPES)
+
+
+def get_all_values_with_retry(ws):
+    """Reads a worksheet's values, retrying with backoff on rate-limit
+    errors instead of silently giving up. Ported from
+    sync_data_processing_metrics.py, which hit this exact failure first:
+    a plain try/except around get_all_values() swallowed 429s across
+    dozens of tabs, and only one tab's data ever made it through. In
+    THIS script the consequence is worse than a missing data point -
+    once one worksheet hits an unretried 429, every subsequent
+    worksheet in the loop (including whichever one is the current
+    month's tab) gets skipped too, since the quota window doesn't clear
+    mid-run - turning a transient rate limit into "could not find ANY
+    parseable billing period across the whole sheet" and a completely
+    empty run."""
+    for attempt in range(SHEETS_MAX_RETRIES):
+        try:
+            values = ws.get_all_values()
+            time.sleep(SHEETS_REQUEST_DELAY_SECONDS)
+            return values
+        except gspread.exceptions.APIError as e:
+            status = getattr(e.response, "status_code", None)
+            is_rate_limit = status == 429 or (
+                e.response is not None and "RESOURCE_EXHAUSTED" in e.response.text
+            )
+            if not is_rate_limit:
+                raise
+            wait = (2 ** attempt) * 2
+            print(f"Sheets API rate limited reading '{ws.title}', waiting {wait}s (attempt {attempt + 1}/{SHEETS_MAX_RETRIES})")
+            time.sleep(wait)
+    raise RuntimeError(f"Still rate limited reading '{ws.title}' after {SHEETS_MAX_RETRIES} retries")
 
 
 def parse_utc_datetime(value):
@@ -773,17 +818,15 @@ def get_or_create_batch_due_at(month_key, due_day_group, count_needed, apply_sta
 def main(dry_run=False, month_override=None, as_of_day_override=None):
     creds = get_credentials()
 
-    import gspread
     gc = gspread.authorize(creds)
     spreadsheet = gc.open_by_key(SHEET_ID)
 
     values_by_title = {}
     for ws in spreadsheet.worksheets():
         try:
-            values_by_title[ws.title] = ws.get_all_values()
-            time.sleep(1.1)
+            values_by_title[ws.title] = get_all_values_with_retry(ws)
         except Exception as e:
-            print(f"Skipping worksheet '{ws.title}': {e}")
+            print(f"Skipping worksheet '{ws.title}' after retries failed: {e}")
 
     if month_override:
         target_month = month_override
