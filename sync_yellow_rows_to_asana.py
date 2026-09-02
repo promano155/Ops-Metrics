@@ -307,6 +307,98 @@ def get_asana_sections():
     return asana_request("GET", f"/projects/{ASANA_PROJECT_GID}/sections")
 
 
+def fetch_all_project_tasks(project_gid):
+    """Paginates through every TOP-LEVEL task currently in the project.
+    This project uses standalone tasks only (see the module docstring -
+    every hotel is created directly in a section, no parent/subtask
+    nesting at all), so a single top-level listing is a complete
+    picture of every hotel task that exists right now. This is
+    deliberately NOT built on top of find_duplicate_hotel_tasks.py /
+    delete_duplicate_hotel_tasks.py, which are still written for the
+    retired parent+subtask design and only ever scan SUBTASKS of
+    top-level parents - under the current standalone-task design they
+    would never see a duplicate at all, since there's no parent for the
+    duplicates to be subtasks of."""
+    tasks = []
+    params = {"project": project_gid, "opt_fields": "name,created_at,completed", "limit": 100}
+    url = "https://app.asana.com/api/1.0/tasks"
+    while True:
+        for attempt in range(5):
+            resp = requests.get(url, headers=asana_headers(), params=params, timeout=30)
+            if resp.status_code == 429:
+                wait = float(resp.headers.get("Retry-After", 2 ** attempt))
+                print(f"Asana rate limited fetching tasks, waiting {wait}s (attempt {attempt + 1}/5)")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
+        else:
+            raise RuntimeError("Asana still rate limited after 5 retries while fetching tasks")
+        body = resp.json()
+        tasks.extend(body["data"])
+        next_page = body.get("next_page")
+        if not next_page:
+            break
+        params = {**params, "offset": next_page["offset"]}
+        time.sleep(0.3)
+    return tasks
+
+
+def delete_asana_task(task_gid):
+    asana_request("DELETE", f"/tasks/{task_gid}")
+
+
+def sweep_duplicate_hotel_tasks(dry_run=False):
+    """Scans every top-level task currently in the project, groups them
+    by EXACT name match, and for any hotel with more than one task,
+    always favors the first entry: the earliest-created task is kept,
+    and every later task with the identical name is swept (deleted).
+
+    This only sweeps when the kept (earliest) task is still OPEN. If the
+    earliest task is already completed, duplicates are left untouched -
+    a second task for an already-completed hotel could be legitimate
+    new work (a different billing cycle, a reopened data issue), not an
+    actual duplicate, so this is left for a human to judge rather than
+    auto-deleted.
+
+    This is a name-based sweep independent of the Supabase dedup table -
+    it catches duplicates regardless of how they were created (via this
+    script, manually, or from a stale dedup record before this or a
+    prior fix), and complements rather than replaces the dedup_key
+    checks in already_actioned_with_legacy_fallback()."""
+    tasks = fetch_all_project_tasks(ASANA_PROJECT_GID)
+    by_name = {}
+    for t in tasks:
+        by_name.setdefault(t["name"], []).append(t)
+
+    any_swept = False
+    for name, group in by_name.items():
+        if len(group) < 2:
+            continue
+        group_sorted = sorted(group, key=lambda t: t["created_at"])
+        keeper, duplicates = group_sorted[0], group_sorted[1:]
+
+        if keeper["completed"]:
+            print(f"'{name}': {len(duplicates)} duplicate(s) found, but the earliest task "
+                  f"({keeper['gid']}) is already completed - leaving duplicates in place for "
+                  f"manual review rather than assuming a completed hotel's extra task is a "
+                  f"true duplicate.")
+            continue
+
+        any_swept = True
+        for dup in duplicates:
+            if dry_run:
+                print(f"[DRY RUN] Would sweep duplicate task {dup['gid']} for '{name}' "
+                      f"(keeping earliest task {keeper['gid']}, created {keeper['created_at']}).")
+            else:
+                delete_asana_task(dup["gid"])
+                print(f"Swept duplicate task {dup['gid']} for '{name}' "
+                      f"(kept earliest task {keeper['gid']}, created {keeper['created_at']}).")
+
+    if not any_swept:
+        print("Duplicate sweep: no open-and-duplicated hotel tasks found.")
+
+
 def find_section_gid(sections, name):
     for s in sections:
         if s["name"].strip().lower() == name.strip().lower():
@@ -747,6 +839,14 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
     else:
         priority_section_gid = "DRY_RUN_PRIORITY_SECTION"
         standard_section_gid = "DRY_RUN_STANDARD_SECTION"
+
+    # Sweep existing duplicate hotel tasks BEFORE looking at the sheet at
+    # all - this is independent of what's flagged this run. Catches
+    # duplicates from any source (this script, manual creation, or a
+    # stale dedup record from before the existence-check fix), always
+    # keeping the earliest task and only when that earliest task is
+    # still open (see sweep_duplicate_hotel_tasks docstring).
+    sweep_duplicate_hotel_tasks(dry_run=dry_run)
 
     # Pass 1: figure out which rows are new (Flag to Innova checked, not
     # yet actioned). Split into two paths:
