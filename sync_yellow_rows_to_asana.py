@@ -393,7 +393,7 @@ def delete_asana_task(task_gid):
     asana_request("DELETE", f"/tasks/{task_gid}")
 
 
-def sweep_duplicate_hotel_tasks(dry_run=False):
+def sweep_duplicate_hotel_tasks(tasks, dry_run=False):
     """Scans every top-level task currently in the project, groups them
     by EXACT name match, and for any hotel with more than one task,
     always favors the first entry: the earliest-created task is kept,
@@ -410,8 +410,12 @@ def sweep_duplicate_hotel_tasks(dry_run=False):
     it catches duplicates regardless of how they were created (via this
     script, manually, or from a stale dedup record before this or a
     prior fix), and complements rather than replaces the dedup_key
-    checks in already_actioned_with_legacy_fallback()."""
-    tasks = fetch_all_project_tasks(ASANA_PROJECT_GID)
+    checks in already_actioned_with_legacy_fallback().
+
+    Takes the project's current task list as a parameter (fetched once
+    in main() and shared with has_open_task_for_hotel below) rather than
+    fetching it itself, so a single run only pulls the full task list
+    from Asana once."""
     by_name = {}
     for t in tasks:
         by_name.setdefault(t["name"], []).append(t)
@@ -442,6 +446,27 @@ def sweep_duplicate_hotel_tasks(dry_run=False):
 
     if not any_swept:
         print("Duplicate sweep: no open-and-duplicated hotel tasks found.")
+
+
+def build_open_hotel_task_names(tasks):
+    """Returns the set of hotel names that currently have AT LEAST ONE
+    OPEN task in the project, regardless of which month/dedup key
+    created it.
+
+    The dedup_key check in already_actioned_with_legacy_fallback only
+    ever asks "does THIS MONTH already have a record for this hotel?" -
+    it has no concept of whether last month's task ever got resolved.
+    A hotel is supposed to get a new task each month (each billing
+    period is genuinely separate work), but only once the PREVIOUS
+    month's task is actually closed out - not just because a new
+    month's row got flagged while the old task is still sitting open.
+    Without this check, a hotel whose prior task drags on unresolved
+    gets ANOTHER task piled on top of it every time the sheet rolls to
+    a new month, rather than the existing one just carrying forward.
+
+    Built from the same task list sweep_duplicate_hotel_tasks already
+    fetched, so this costs no extra Asana calls."""
+    return {t["name"] for t in tasks if not t["completed"]}
 
 
 def find_section_gid(sections, name):
@@ -883,13 +908,24 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         priority_section_gid = "DRY_RUN_PRIORITY_SECTION"
         standard_section_gid = "DRY_RUN_STANDARD_SECTION"
 
+    # Fetch the project's current tasks ONCE, shared between the
+    # duplicate sweep and the open-task guard below - both are name-based
+    # checks over the same live Asana state, so there's no reason to
+    # pull the full task list from Asana twice in one run.
+    project_tasks = fetch_all_project_tasks(ASANA_PROJECT_GID)
+
     # Sweep existing duplicate hotel tasks BEFORE looking at the sheet at
     # all - this is independent of what's flagged this run. Catches
     # duplicates from any source (this script, manual creation, or a
     # stale dedup record from before the existence-check fix), always
     # keeping the earliest task and only when that earliest task is
     # still open (see sweep_duplicate_hotel_tasks docstring).
-    sweep_duplicate_hotel_tasks(dry_run=dry_run)
+    sweep_duplicate_hotel_tasks(project_tasks, dry_run=dry_run)
+
+    # Hotels with an open task from ANY prior month/run - a new task
+    # should never be created for these until the existing one is
+    # actually resolved (see build_open_hotel_task_names docstring).
+    open_hotel_task_names = build_open_hotel_task_names(project_tasks)
 
     # Pass 1: figure out which rows are new (Flag to Innova checked, not
     # yet actioned). Split into two paths:
@@ -925,6 +961,16 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         dedup_key = f"{sheet_title}:{hotel_name}"
         if already_actioned_with_legacy_fallback(sheet_title, target_month, hotel_name, dry_run=dry_run):
             # read-only either way, safe in dry-run
+            continue
+
+        if hotel_name in open_hotel_task_names:
+            # This month's dedup key looks new, but the hotel already has
+            # an unresolved task sitting open from a prior month/run.
+            # Monthly recurrence should pick up again once that task is
+            # actually closed out, not pile a new one on top of it while
+            # it's still open (see build_open_hotel_task_names docstring).
+            print(f"Skipping '{hotel_name}' - already has an open task in the project "
+                  f"from a previous cycle; won't create another until that one is resolved.")
             continue
 
         data_automated_value = (
