@@ -2,9 +2,9 @@ name: Daily completions digest
 
 on:
   schedule:
-    # 12:00 UTC daily. Own lean, single-purpose job, separate from the
-    # main billing pipeline's schedule.
-    - cron: "0 12 * * *"
+    # 12:00 UTC Monday-Thursday only — Fri/Sat/Sun skipped since a
+    # separate summary covers those.
+    - cron: "0 12 * * 1,2,3,4"
 
   workflow_dispatch:
     inputs:
