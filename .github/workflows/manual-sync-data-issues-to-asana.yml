@@ -1,0 +1,60 @@
+name: manual-sync-data-issues-to-asana
+
+# Manual-trigger only, per project convention (no native GitHub schedule -
+# see sync_data_processing_metrics.py etc. for why: cron-job.org dispatches
+# scheduled runs via this same workflow_dispatch trigger instead). This
+# workflow currently points at a disposable TEST Asana project and _test
+# Supabase tables (see sync_data_issues_to_asana.py's config comments) -
+# safe to run repeatedly while validating.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (no Asana/Supabase writes) - leave checked while validating"
+        required: true
+        type: boolean
+        default: true
+      month:
+        description: "Override target month, e.g. 2026-09 (leave blank to auto-detect the latest month in the sheet)"
+        required: false
+        type: string
+      as_of_day:
+        description: "Simulate 'today' as this day-of-month (only meaningful together with month override)"
+        required: false
+        type: string
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install gspread requests google-auth
+
+      - name: Run sync
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          ASANA_PAT: ${{ secrets.ASANA_PAT }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ -n "${{ inputs.month }}" ]; then
+            ARGS="$ARGS --month ${{ inputs.month }}"
+          fi
+          if [ -n "${{ inputs.as_of_day }}" ]; then
+            ARGS="$ARGS --as-of-day ${{ inputs.as_of_day }}"
+          fi
+          echo "Running: python sync_data_issues_to_asana.py $ARGS"
+          python sync_data_issues_to_asana.py $ARGS
