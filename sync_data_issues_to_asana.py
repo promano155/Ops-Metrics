@@ -111,6 +111,10 @@ COLUMN_ALIASES = {
     "send_by_date": ["Send by Date"],
     "data_automated": ["Data Automated"],
 }
+MONTH_NAMES = [
+    'January','February','March','April','May','June',
+    'July','August','September','October','November','December'
+]
 
 # ---------------------------------------------------------------------------
 # Google Sheets
@@ -184,32 +188,30 @@ def find_col_index(headers, alias_key):
     return None
 
 
-def find_latest_month_key(values_by_title):
-    """Scans every worksheet's Billing Period Analyzed values and returns
-    the MOST RECENT month_key actually found. Unchanged from the original
-    script."""
-    today = dt.date.today()
-    earliest_plausible = month_key_shift(today, -1)
-    latest_plausible = month_key_shift(today, 0)
-
+def find_latest_month_key_from_tab_names(worksheet_titles):
+    """Determines the latest month by parsing TAB NAMES directly (e.g.
+    'July 2026 - Media Brands'), matching the exact convention Apps
+    Script's own getLatestSheetName() already relies on - rather than
+    scanning cell values with a calendar-relative plausibility window.
+    Invoice Horizon's tabs are reliably named this way, so this is both
+    simpler and immune to 'how far behind real-time is the team right
+    now' questions entirely."""
     latest = None
-    for values in values_by_title.values():
-        if not values:
+    latest_sort_key = None
+    for title in worksheet_titles:
+        match = re.match(r'^(\w+)\s+(\d{4})\s*[-–]\s*Media\s+Brands?$', title, re.IGNORECASE)
+        if not match:
             continue
-        headers = values[0]
-        col_period = find_col_index(headers, "billing_period")
-        if col_period is None:
+        month_name, year_str = match.group(1), match.group(2)
+        month_lower = [m.lower() for m in MONTH_NAMES]
+        if month_name.lower() not in month_lower:
             continue
-        for row in values[1:]:
-            if len(row) <= col_period:
-                continue
-            month_key = parse_billing_period(row[col_period])
-            if month_key is None:
-                continue
-            if not (earliest_plausible <= month_key <= latest_plausible):
-                continue
-            if latest is None or month_key > latest:
-                latest = month_key
+        month_idx = month_lower.index(month_name.lower())
+        year = int(year_str)
+        sort_key = year * 100 + month_idx
+        if latest_sort_key is None or sort_key > latest_sort_key:
+            latest_sort_key = sort_key
+            latest = f"{year:04d}-{month_idx + 1:02d}"
     return latest
 
 
@@ -627,7 +629,7 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
     if month_override:
         target_month = month_override
     else:
-        target_month = find_latest_month_key(values_by_title)
+        target_month = find_latest_month_key_from_tab_names(values_by_title.keys())
         if target_month is None:
             print("Could not find ANY parseable billing period across the whole sheet - nothing to do.")
             return
