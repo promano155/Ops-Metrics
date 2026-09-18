@@ -1,110 +1,76 @@
 """
 sync_hubspot_ticket_sla.py
 
-Two related things, one daily run, both scoped to tickets owned by
-Javiana Pacheco, Lucas Berberian, or Victoria Camacho:
+Replaces the manually-updated "HubSpot ticket SLA" tracker (previously
+owned by Ben, who has since left) with a live pull from HubSpot.
 
-1. OPEN TICKET BUCKETS ("Currently sitting with") - a live snapshot,
-   not a monthly metric. For every currently-open ticket owned by the
-   three of them, buckets it by CURRENT pipeline stage into who is
-   actually holding it up right now:
+--- Why the numbers here won't match the old screenshot ---
+The old tracker's exact scope died with whoever set it up - there was no
+documented rule for what counted. Rather than guess at a filter we can't
+verify, this is a fresh, simple, documented definition going forward:
 
-     with_ops      - New Request / In Progress - actively being worked,
-                     nothing external blocking it
-     cs_feedback   - CS Feedback Required
-     tech          - Tech Action Required
-     finance       - Finance Action Required
-     media_brand   - Media Brand Feedback Required
-     innova        - Innova Feedback Required (the vendor)
-     hotel_client  - Client Input Required
-     long_term     - Long Term Request (No SLA) - open-ended by design,
-                     not "blocked" in the normal sense
+  SCOPE = every ticket owned by Javiana Pacheco, Lucas Berberian, or
+  Victoria Camacho, closed in the given month, regardless of ticket type.
 
-   Content Request Rejected and Completed are terminal and excluded
-   entirely (not open). One row per scope ('team' + each of the three
-   names), overwritten every run - there's no historical "open right
-   now as of last Tuesday" concept worth keeping.
+  SLA MET = computed independently from raw timestamps
+  (closed_date vs. hs_time_to_close_sla_at), NOT read from HubSpot's own
+  time_to_close__met_sla or hs_time_to_close_sla_status fields. Those two
+  HubSpot-calculated fields were found to disagree with each other on
+  real tickets during the investigation that led to this rewrite (one
+  said "completed on time," the other said the same ticket didn't meet
+  SLA). Rather than pick one black box over another, this pipeline
+  derives met/not-met itself from the raw dates, which is auditable and
+  reproducible. See compute_met_sla() below for the exact formula,
+  including the "adjusted for other-team time" version.
 
-2. MONTHLY SLA, RAW AND ADJUSTED - same current/closed lock pattern as
-   the other syncs (current month recomputed daily, past months written
-   once and left alone), but now computed per-ticket instead of via
-   HubSpot's count-only search, because the adjusted number needs each
-   ticket's own numbers to work with:
+If the team later decides this should be scoped to specific ticket types
+(e.g. only Data Processing Request / Reconciliation / Invoice-related
+tickets), update OWNER_IDS filtering logic accordingly - see the
+commented-out TICKET_TYPE_FILTER block below for how to add that back in.
 
-     within_sla            - unchanged from before: HubSpot's own
-                              time_to_close__met_sla, wall-clock, no
-                              adjustment. Kept as-is (not overwritten
-                              with a redefinition) so nothing already
-                              reported quietly changes meaning.
-     within_sla_adjusted    - subtracts time the ticket spent sitting in
-                              Tech / Finance / Media Brand / Innova
-                              Feedback Required (pulled from HubSpot's
-                              own hs_v2_cumulative_time_in_<stageId>
-                              fields, which persist after the ticket
-                              moves on or closes) from the elapsed
-                              close time, then compares THAT against the
-                              ticket's original SLA target duration
-                              (hs_time_to_close_sla_at - createdate).
-     eligible_for_adjusted  - count of closed tickets that actually HAD
-                              an SLA target at all (hs_time_to_close_sla_at
-                              present). Tickets with no target (e.g.
-                              "Long Term Action (No SLA)" ticket type)
-                              are excluded from the adjusted percentage's
-                              denominator, same as they're already
-                              excluded from HubSpot's own SLA field -
-                              this is NOT the same denominator as
-                              tickets_closed, so sla_pct_adjusted is
-                              computed against eligible_for_adjusted,
-                              not tickets_closed.
+Same current/closed lock pattern as the other syncs: current month
+recomputed daily, past months written once and left alone.
 
-   CS Feedback Required and Client Input Required time is deliberately
-   NOT subtracted for the adjusted metric - only the four stages above
-   that represent another INTERNAL team (or the vendor) holding the
-   ball. If that scope should widen, say so explicitly rather than
-   assuming - this was a specific, scoped ask.
+--- New: "adjusted for other-team time" is now a real, shared formula ---
+Previously the SLA % card and this script's "within_sla" count were two
+independently-built things with no relationship to each other. They now
+share one source of truth: STAGE_BUCKET_MAP (see below), which maps
+every Support Pipeline stage to who currently owns the ticket. A ticket
+that spent time in the tech / finance / media_brand / innova stages was
+waiting on someone outside ops - compute_met_sla() pushes that ticket's
+SLA deadline out by exactly that much time (pulled from HubSpot's own
+per-stage cumulative-time properties) before checking whether it closed
+in time, which is the "adjustment." A ticket with no hs_time_to_close_
+sla_at at all (no SLA target applies) is excluded from the SLA
+denominator entirely - this is the "eligible tickets" scoping already
+visible on the dashboard card. hubspot_ticket_sla_monthly gains three
+new, additive columns for this: eligible_closed, within_sla_adjusted,
+sla_pct_adjusted. tickets_closed keeps its original meaning (every
+closed ticket, eligible or not); within_sla/sla_pct are now computed
+the same deterministic way but WITHOUT the other-team adjustment, so
+both the raw and adjusted views stay available side by side. See the
+ALTER TABLE statement in the delivery notes for the exact columns to add.
 
-3. TOP BLOCKER (monthly, per scope) - which of the six blocker stages
-   (the four above, plus CS Feedback Required and Client Input Required
-   - a wider set than #2 uses, by explicit request) ate the most total
-   hours across that scope's closed tickets this month. Computed from
-   the same hs_v2_cumulative_time_in_<stageId> fields already being
-   pulled for #2, just summed across ALL closed tickets in the month
-   rather than per-ticket. tech_hours / finance_hours / media_brand_hours
-   / innova_hours / cs_feedback_hours / hotel_client_hours are the raw
-   per-stage totals (in hours); top_blocker / top_blocker_hours name
-   whichever one was largest. A month with nothing in any blocker stage
-   gets top_blocker = None, not a misleading zero-hour "winner."
-
-   The team's top_blocker is recomputed from the SUMMED totals across
-   Javiana/Lucas/Victoria, not derived from their three individual top
-   blockers - those can legitimately disagree with each other and with
-   the team's own answer once combined.
-
---- Why per-ticket fetch instead of count-only search now ---
-The old version only ever asked HubSpot for two counts (total closed,
-within-SLA) via the search endpoint's `total`. That's enough for the
-raw number but can't produce the adjusted one - there's no way to ask
-HubSpot's search API "give me the count where (elapsed - stage time) is
-under X" server-side. So this version fetches each ticket's own fields
-and computes both numbers in Python, the same way every other script in
-this pipeline already handles anything that isn't a flat filter+count.
-
---- Why hs_v2_cumulative_time_in_<stageId>, not entered/exited timestamps ---
-HubSpot already maintains a running total, in milliseconds, of time
-spent in a given stage across the ticket's WHOLE life - including
-stages it has since left, and it survives the ticket closing. That
-means a ticket that bounced into Tech Action Required twice still gets
-correctly summed, with no interval math needed on this end. Confirmed
-this is actually populated on closed tickets (not just currently-open
-ones) before relying on it.
-
---- Units ---
-time_to_close, hs_time_to_close_sla_at, createdate, and every
-hs_v2_cumulative_time_in_<stageId> field are all in the same units
-HubSpot returns them in: epoch milliseconds for the dates, plain
-milliseconds for the durations. Confirmed by cross-checking a real
-ticket's time_to_close against its createdate/closed_date gap before
-trusting the field.
+--- New: live "currently open" snapshot (Tickets Still Open panel) ---
+Added to back a dashboard panel that shows, per person, how many
+tickets are open RIGHT NOW and which team each one is currently
+blocked on - distinct from (and not derived from) the
+SLA-on-closed-tickets numbers above. This is a "right now" snapshot,
+not a per-month historical metric, so it:
+  - writes to its own tables (hubspot_ticket_open_buckets for per-scope
+    counts, hubspot_ticket_open_detail for the per-ticket drill-down),
+    never hubspot_ticket_sla_monthly - that table's past months are
+    locked and must never be silently touched, and an
+    always-overwritten live count has no business sharing a table with
+    frozen numbers.
+  - is always overwritten, never locked, same category as the
+    open-by-stage snapshot in sync_hubspot_ticket_metrics.py.
+The bucket columns (with_ops/cs_feedback/tech/finance/media_brand/
+innova/hotel_client/long_term/unmapped) map to the Support Pipeline's
+actual stage list - see the comment above STAGE_BUCKET_MAP for the
+confirmed stage-id -> bucket mapping and the one deliberately-unmapped
+stage. This was verified directly against HubSpot's own property
+labels (search_properties), not guessed.
 """
 
 import os
@@ -120,69 +86,98 @@ import requests
 HUBSPOT_TOKEN = os.environ["HUBSPOT_PRIVATE_APP_TOKEN"]
 HUBSPOT_SEARCH_URL = "https://api.hubapi.com/crm/v3/objects/tickets/search"
 
+# This script fires 2 requests per owner per month (closed count + within-SLA
+# count) across a 24-month backfill, which adds up fast - throttled and
+# retried on 429s so a burst of rate limiting doesn't kill the whole run.
 REQUEST_DELAY_SECONDS = 0.3
 MAX_RETRIES = 5
-PAGE_SIZE = 100
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-SLA_TABLE = "hubspot_ticket_sla_monthly"
-OPEN_BUCKETS_TABLE = "hubspot_ticket_open_buckets"
+TABLE = "hubspot_ticket_sla_monthly"
 
+# Pulled live from the portal via search_owners - update here if these
+# three change roles or someone new joins ops.
 OWNERS = {
     79058582: "Javiana",
     1985678304: "Lucas",
     90048338: "Victoria",
 }
 
-# Pulled live from the portal (Support Pipeline, id "0") on 2026-08-25.
-# If HubSpot support adds/renames a stage, update these maps rather than
-# touching the bucketing/adjustment logic below.
-STAGE_COMPLETED = "964383047"
-STAGE_CONTENT_REJECTED = "1062225450"  # terminal, excluded like Completed
-
-BUCKET_BY_STAGE_ID = {
-    "1": "with_ops",              # New Request
-    "2": "with_ops",              # In Progress
-    "3": "cs_feedback",           # CS Feedback Required
-    "4": "hotel_client",          # Client Input Required
-    "1008389482": "tech",         # Tech Action Required
-    "1020326275": "finance",      # Finance Action Required
-    "1061150809": "media_brand",  # Media Brand Feedback Required
-    "1405980051": "innova",       # Innova Feedback Required
-    "1181474568": "long_term",    # Long Term Request (No SLA)
-}
-BUCKET_NAMES = ["with_ops", "cs_feedback", "tech", "finance", "media_brand", "innova", "hotel_client", "long_term"]
-
-# All 6 "someone other than ops is holding this" stages, for the
-# top-blocker card. Keys match the bucket names used for open tickets so
-# the two views use consistent language.
-BLOCKER_STAGE_FIELDS = {
-    "tech": "hs_v2_cumulative_time_in_1008389482",
-    "finance": "hs_v2_cumulative_time_in_1020326275",
-    "media_brand": "hs_v2_cumulative_time_in_1061150809",
-    "innova": "hs_v2_cumulative_time_in_1405980051",
-    "cs_feedback": "hs_v2_cumulative_time_in_3",
-    "hotel_client": "hs_v2_cumulative_time_in_4",
-}
-BLOCKER_LABELS = {
-    "tech": "Tech",
-    "finance": "Finance",
-    "media_brand": "Media/brand",
-    "innova": "Innova",
-    "cs_feedback": "CS feedback",
-    "hotel_client": "Hotel/client",
-}
-
-# Narrower subset used ONLY for the adjusted-SLA time subtraction -
-# another INTERNAL team or the vendor holding the ball, not CS or the
-# client. Derived from BLOCKER_STAGE_FIELDS so the two lists can't drift
-# apart from each other by accident.
-OTHER_TEAM_TIME_FIELDS = [
-    BLOCKER_STAGE_FIELDS[k] for k in ("tech", "finance", "media_brand", "innova")
-]
+# TICKET_TYPE_FILTER = [
+#     "Data Processing Request", "Reconciliation Request",
+#     "Data Automation Setup", "Data Automation Issue",
+#     "Invoice Adjustment Request", "Invoice Error", "Invoice Escalation",
+#     "Custom Invoice Request",
+# ]
+# To scope by type instead of just owner, add:
+#   {"propertyName": "ticket_type", "operator": "IN", "values": TICKET_TYPE_FILTER}
+# to the filters list in tickets_for_owner() below.
 
 TRAILING_MONTHS = 24
+
+# Support Pipeline stage -> (bucket, human label). Confirmed directly
+# against HubSpot's own property labels (search_properties), not guessed.
+# Shared by both features in this script:
+#   - the monthly SLA adjustment (compute_met_sla) uses OTHER_TEAM_BUCKETS
+#     below to know which stages count as "waiting on another team"
+#   - the live open-ticket snapshot (open_tickets_for_owner) uses the
+#     full map to bucket every currently-open ticket
+#
+#   1           New Request                    -> with_ops
+#   2           In Progress                     -> with_ops
+#   3           CS Feedback Required             -> cs_feedback
+#   4           Client Input Required            -> hotel_client
+#   1008389482  Tech Action Required             -> tech
+#   1020326275  Finance Action Required          -> finance
+#   1061150809  Media Brand Feedback Required    -> media_brand
+#   1405980051  Innova Feedback Required         -> innova
+#   1181474568  Long Term Request (No SLA)       -> long_term
+#   964383047   Completed                        -> (closed - tickets in
+#                                                    this stage always
+#                                                    have closed_date set,
+#                                                    so they never reach
+#                                                    this map via the
+#                                                    open-ticket path, and
+#                                                    the closed-ticket path
+#                                                    doesn't bucket by
+#                                                    stage at all)
+#
+# 1062225450 "Content Request Rejected" is deliberately left OUT of the
+# map - it's a dead/terminal-ish state but doesn't set closed_date, so a
+# ticket sitting there still shows as "open." Rather than guess whether
+# that should count as with_ops, long_term, or something else, it falls
+# into 'unmapped' so it's visible instead of silently misclassified. If
+# the team decides this stage means something specific, add it here.
+STAGE_BUCKET_MAP = {
+    "1": ("with_ops", "New Request"),
+    "2": ("with_ops", "In Progress"),
+    "3": ("cs_feedback", "CS Feedback Required"),
+    "4": ("hotel_client", "Client Input Required"),
+    "1008389482": ("tech", "Tech Action Required"),
+    "1020326275": ("finance", "Finance Action Required"),
+    "1061150809": ("media_brand", "Media Brand Feedback Required"),
+    "1405980051": ("innova", "Innova Feedback Required"),
+    "1181474568": ("long_term", "Long Term Request (No SLA)"),
+}
+
+# Must match hubspot_ticket_open_buckets' columns exactly (minus scope/
+# total_open/updated_at) - this list IS the table's bucket schema.
+BUCKET_COLUMNS = [
+    "with_ops", "cs_feedback", "tech", "finance",
+    "media_brand", "innova", "hotel_client", "long_term", "unmapped",
+]
+
+# Which buckets count as "waiting on another team" for the SLA
+# adjustment - i.e. NOT with_ops/cs_feedback/hotel_client/long_term.
+# Derived from STAGE_BUCKET_MAP rather than listed separately, so the
+# open-ticket bucketing and the SLA adjustment can never drift apart.
+OTHER_TEAM_BUCKETS = {"tech", "finance", "media_brand", "innova"}
+OTHER_TEAM_TIME_PROPS = [
+    f"hs_v2_cumulative_time_in_{stage_id}"
+    for stage_id, (bucket, _label) in STAGE_BUCKET_MAP.items()
+    if bucket in OTHER_TEAM_BUCKETS
+]
 
 # ---------------------------------------------------------------------------
 # HubSpot
@@ -196,45 +191,49 @@ def hubspot_headers():
     }
 
 
-def hubspot_search(filter_groups, properties, after=None):
-    body = {
-        "filterGroups": filter_groups,
-        "properties": properties,
-        "limit": PAGE_SIZE,
-    }
-    if after:
-        body["after"] = after
-    for attempt in range(MAX_RETRIES):
-        resp = requests.post(HUBSPOT_SEARCH_URL, headers=hubspot_headers(), json=body, timeout=30)
-        if resp.status_code == 429:
-            retry_after = float(resp.headers.get("Retry-After", 2 ** attempt))
-            print(f"Rate limited, waiting {retry_after}s (attempt {attempt + 1}/{MAX_RETRIES})")
-            time.sleep(retry_after)
-            continue
-        resp.raise_for_status()
-        time.sleep(REQUEST_DELAY_SECONDS)
-        return resp.json()
-    raise RuntimeError("HubSpot search still rate limited after max retries")
+def hubspot_search_records(filters, properties, page_limit=100):
+    """Paginated HubSpot ticket search returning full records (not just
+    a count) via HubSpot's search 'after' cursor. Used everywhere in
+    this script now - both the monthly SLA calc and the open-ticket
+    snapshot need actual property values per ticket (closed_date,
+    per-stage cumulative time, subject, etc.), not just a total.
 
-
-def fetch_all_tickets(filter_groups, properties):
-    """Paginates a HubSpot ticket search to completion. Used for both the
-    open-tickets pull and the per-month closed-tickets pull - anywhere we
-    need each ticket's own fields, not just a count."""
+    Sorted oldest-created-first as a sane default; callers that need a
+    different order can re-sort the returned list."""
     results = []
     after = None
     while True:
-        body = hubspot_search(filter_groups, properties, after=after)
-        results.extend(body.get("results", []))
-        paging = body.get("paging", {}).get("next")
-        if not paging:
+        body = {
+            "filterGroups": [{"filters": filters}],
+            "properties": properties,
+            "limit": page_limit,
+            "sorts": [{"propertyName": "createdate", "direction": "ASCENDING"}],
+        }
+        if after:
+            body["after"] = after
+
+        for attempt in range(MAX_RETRIES):
+            resp = requests.post(HUBSPOT_SEARCH_URL, headers=hubspot_headers(), json=body, timeout=30)
+            if resp.status_code == 429:
+                retry_after = float(resp.headers.get("Retry-After", 2 ** attempt))
+                print(f"Rate limited, waiting {retry_after}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(retry_after)
+                continue
+            resp.raise_for_status()
             break
-        after = paging["after"]
+        else:
+            raise RuntimeError("HubSpot search still rate limited after max retries")
+
+        time.sleep(REQUEST_DELAY_SECONDS)
+        payload = resp.json()
+        results.extend(payload.get("results", []))
+
+        next_page = payload.get("paging", {}).get("next")
+        if not next_page:
+            break
+        after = next_page["after"]
+
     return results
-
-
-def to_millis(d):
-    return int(dt.datetime.combine(d, dt.time.min, tzinfo=dt.timezone.utc).timestamp() * 1000)
 
 
 def month_bounds(month_key):
@@ -244,65 +243,167 @@ def month_bounds(month_key):
     return start, end
 
 
-def parse_hubspot_epoch_ms(value):
-    """HubSpot returns these as either an ISO string or a millisecond
-    epoch string depending on endpoint - normalize to int ms."""
-    if value is None or value == "":
+def to_millis(d):
+    return int(dt.datetime.combine(d, dt.time.min, tzinfo=dt.timezone.utc).timestamp() * 1000)
+
+
+def parse_utc_datetime(value):
+    """Same robust parser used elsewhere in this pipeline (see
+    sync_yellow_rows_to_asana.py / sync_ops_task_tracker.py) - handles
+    Supabase's and HubSpot's real timestamp formats ('+00', '+00:00',
+    'Z', bare) and always returns a naive UTC datetime so it stays
+    comparable with dt.datetime.utcnow()."""
+    if value is None:
         return None
-    if isinstance(value, (int, float)):
-        return int(value)
-    value = str(value)
-    if value.isdigit():
-        return int(value)
-    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return int(parsed.timestamp() * 1000)
+    value = value.strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    parsed = dt.datetime.fromisoformat(value)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def compute_met_sla(props):
+    """Returns (raw_met, adjusted_met, other_team_ms) for one closed
+    ticket's properties, or (None, None, 0) if it has no SLA target at
+    all (hs_time_to_close_sla_at missing) - such a ticket is excluded
+    from the SLA denominator entirely rather than guessed either way.
+
+    raw_met: closed_date <= hs_time_to_close_sla_at, computed directly
+             from the raw dates. Deliberately NOT read from HubSpot's
+             own time_to_close__met_sla or hs_time_to_close_sla_status
+             fields - those two were found to disagree with each other
+             on real tickets, so neither is trusted as ground truth here.
+
+    adjusted_met: same comparison, but the deadline is pushed out by
+                  other_team_ms - the total time this ticket spent in
+                  an OTHER_TEAM_BUCKETS stage (tech/finance/media_brand/
+                  innova), pulled from HubSpot's own per-stage
+                  cumulative-time properties. Equivalent to pausing the
+                  SLA clock while the ticket was waiting on someone
+                  outside ops, computed after the fact since
+                  hs_sla_pause_status isn't actually populated on any
+                  ticket checked during this investigation.
+
+    other_team_ms: the raw adjustment amount, in case a caller wants it
+                   (e.g. for logging/debugging a specific ticket)."""
+    closed_date = parse_utc_datetime(props.get("closed_date"))
+    sla_due = parse_utc_datetime(props.get("hs_time_to_close_sla_at"))
+    if closed_date is None or sla_due is None:
+        return None, None, 0
+
+    other_team_ms = sum(float(props.get(p) or 0) for p in OTHER_TEAM_TIME_PROPS)
+    adjusted_due = sla_due + dt.timedelta(milliseconds=other_team_ms)
+
+    raw_met = closed_date <= sla_due
+    adjusted_met = closed_date <= adjusted_due
+    return raw_met, adjusted_met, other_team_ms
+
+
+def owner_month_stats(owner_id, month_key):
+    """Returns (tickets_closed, eligible_closed, within_sla,
+    within_sla_adjusted) for one owner/month.
+
+    tickets_closed: every ticket closed in the month, regardless of
+                     whether an SLA target applied to it.
+    eligible_closed: the subset that actually had an SLA target
+                      (hs_time_to_close_sla_at present) - this is the
+                      "eligible tickets" denominator the SLA % card
+                      should use, both raw and adjusted.
+    within_sla / within_sla_adjusted: how many of the eligible tickets
+                      met SLA, without and with the other-team
+                      adjustment respectively. Both are out of
+                      eligible_closed, not tickets_closed."""
+    start, end = month_bounds(month_key)
+    filters = [
+        {"propertyName": "hubspot_owner_id", "operator": "EQ", "value": str(owner_id)},
+        {"propertyName": "closed_date", "operator": "GTE", "value": str(to_millis(start))},
+        {"propertyName": "closed_date", "operator": "LTE", "value": str(to_millis(end) + 86_399_999)},
+    ]
+    properties = ["closed_date", "hs_time_to_close_sla_at"] + OTHER_TEAM_TIME_PROPS
+    records = hubspot_search_records(filters, properties)
+
+    tickets_closed = len(records)
+    eligible_closed = 0
+    within_sla = 0
+    within_sla_adjusted = 0
+
+    for r in records:
+        raw_met, adjusted_met, _ = compute_met_sla(r.get("properties", {}))
+        if raw_met is None:
+            continue  # no SLA target on this ticket - not eligible, not counted either way
+        eligible_closed += 1
+        if raw_met:
+            within_sla += 1
+        if adjusted_met:
+            within_sla_adjusted += 1
+
+    return tickets_closed, eligible_closed, within_sla, within_sla_adjusted
 
 
 # ---------------------------------------------------------------------------
-# Open ticket buckets ("Currently sitting with")
+# Currently-open snapshot (Tickets Still Open panel)
 # ---------------------------------------------------------------------------
+# Buckets every currently-open ticket by STAGE_BUCKET_MAP (defined in
+# Config above, shared with the SLA adjustment). See that block's comment
+# for the confirmed stage-id -> bucket mapping and the deliberately
+# unmapped stage.
+
+OPEN_BUCKETS_TABLE = "hubspot_ticket_open_buckets"     # per-scope bucket counts
+OPEN_DETAIL_TABLE = "hubspot_ticket_open_detail"       # per-ticket rows for the drill-down
 
 
-def fetch_open_tickets_for_owners(owner_ids):
-    filter_groups = [{
-        "filters": [
-            {"propertyName": "hubspot_owner_id", "operator": "IN", "values": [str(o) for o in owner_ids]},
-            {"propertyName": "hs_pipeline_stage", "operator": "NOT_IN",
-             "values": [STAGE_COMPLETED, STAGE_CONTENT_REJECTED]},
-        ]
-    }]
-    return fetch_all_tickets(filter_groups, ["hubspot_owner_id", "hs_pipeline_stage"])
+def open_tickets_for_owner(owner_id):
+    """Every ticket currently owned by owner_id with no closed_date at
+    all - i.e. genuinely still open right now. Returns
+    [{ticket_id, subject, days_open, stage_id, bucket, stage_label}],
+    oldest-created first."""
+    filters = [
+        {"propertyName": "hubspot_owner_id", "operator": "EQ", "value": str(owner_id)},
+        {"propertyName": "closed_date", "operator": "NOT_HAS_PROPERTY"},
+    ]
+    records = hubspot_search_records(
+        filters, properties=["subject", "createdate", "hs_pipeline_stage"]
+    )
 
-
-def compute_open_buckets(tickets):
-    """Returns {owner_name_or_'team': {bucket: count}}. Stages not in
-    BUCKET_BY_STAGE_ID (shouldn't happen given the NOT_IN filter above,
-    but data drifts) are counted under 'unmapped' per scope so a new
-    stage shows up as a visible gap instead of silently vanishing."""
-    scopes = ["team"] + list(OWNERS.values())
-    counts = {scope: {b: 0 for b in BUCKET_NAMES + ["unmapped"]} for scope in scopes}
-
-    for t in tickets:
-        props = t.get("properties", {})
-        owner_id = props.get("hubspot_owner_id")
-        owner_name = OWNERS.get(int(owner_id)) if owner_id else None
-        if owner_name is None:
-            continue  # not one of the three tracked owners
+    now = dt.datetime.utcnow()
+    open_tickets = []
+    for r in records:
+        props = r.get("properties", {})
+        created = parse_utc_datetime(props.get("createdate"))
+        days_open = (now - created).days if created else None
         stage_id = props.get("hs_pipeline_stage")
-        bucket = BUCKET_BY_STAGE_ID.get(stage_id, "unmapped")
-        counts["team"][bucket] += 1
-        counts[owner_name][bucket] += 1
+        bucket, stage_label = STAGE_BUCKET_MAP.get(
+            stage_id, ("unmapped", f"Unmapped stage ({stage_id})")
+        )
+        open_tickets.append({
+            "ticket_id": r["id"],
+            "subject": props.get("subject") or "(no subject)",
+            "days_open": days_open,
+            "stage_id": stage_id,
+            "bucket": bucket,
+            "stage_label": stage_label,
+        })
+    return open_tickets
 
+
+def bucket_open_tickets(open_tickets):
+    """Counts a list of {bucket, ...} dicts into BUCKET_COLUMNS, plus
+    total_open. This drives hubspot_ticket_open_buckets' columns 1:1."""
+    counts = {col: 0 for col in BUCKET_COLUMNS}
+    for t in open_tickets:
+        counts[t["bucket"]] += 1
+    counts["total_open"] = len(open_tickets)
     return counts
 
 
-def upsert_open_buckets(scope, bucket_counts):
-    payload = {
-        "scope": scope,
-        "total_open": sum(bucket_counts[b] for b in BUCKET_NAMES + ["unmapped"]),
-        "updated_at": dt.datetime.utcnow().isoformat(),
-    }
-    payload.update(bucket_counts)
+def upsert_open_buckets(scope, open_tickets):
+    """Single-row-per-scope table, always overwritten - same pattern as
+    overwrite_status_snapshot() in sync_hubspot_ticket_metrics.py. scope
+    is 'team' or one of the OWNERS names ('Javiana'/'Lucas'/'Victoria')."""
+    counts = bucket_open_tickets(open_tickets)
+    payload = {"scope": scope, "updated_at": dt.datetime.utcnow().isoformat(), **counts}
     url = f"{SUPABASE_URL}/rest/v1/{OPEN_BUCKETS_TABLE}"
     resp = requests.post(
         url,
@@ -311,119 +412,79 @@ def upsert_open_buckets(scope, bucket_counts):
         timeout=30,
     )
     resp.raise_for_status()
-    print(f"Upserted open buckets for '{scope}': {payload}")
+    print(f"Upserted open-bucket snapshot for '{scope}': {counts}")
 
 
-# ---------------------------------------------------------------------------
-# Monthly SLA, raw + adjusted
-# ---------------------------------------------------------------------------
+def replace_open_detail(scope, open_tickets):
+    """hubspot_ticket_open_detail is per-TICKET (ticket_id is the primary
+    key), not per-scope, so a plain upsert would leave a stale row behind
+    forever once a ticket closes or changes owner - nothing would ever
+    delete it. Instead: delete every existing detail row for this scope,
+    then insert the current set fresh. Two requests instead of one, but
+    correctness here (no ghost 'still open' tickets lingering in the
+    drill-down) matters more than saving a round trip.
 
-CLOSED_TICKET_PROPERTIES = [
-    "hubspot_owner_id", "createdate", "closed_date", "time_to_close",
-    "time_to_close__met_sla", "hs_time_to_close_sla_at",
-] + list(BLOCKER_STAGE_FIELDS.values())
+    Only called for individual people, not 'team' - a ticket belongs to
+    exactly one owner, so a 'team' scope here would just duplicate every
+    row already written under its owner's name."""
+    delete_url = f"{SUPABASE_URL}/rest/v1/{OPEN_DETAIL_TABLE}"
+    resp = requests.delete(
+        delete_url, headers=supabase_headers(), params={"scope": f"eq.{scope}"}, timeout=30
+    )
+    resp.raise_for_status()
 
+    if not open_tickets:
+        print(f"Cleared open-detail rows for '{scope}' (0 currently open).")
+        return
 
-def fetch_closed_tickets_for_owner_month(owner_id, month_key):
-    start, end = month_bounds(month_key)
-    filter_groups = [{
-        "filters": [
-            {"propertyName": "hubspot_owner_id", "operator": "EQ", "value": str(owner_id)},
-            {"propertyName": "closed_date", "operator": "GTE", "value": str(to_millis(start))},
-            {"propertyName": "closed_date", "operator": "LTE", "value": str(to_millis(end) + 86_399_999)},
-        ]
-    }]
-    return fetch_all_tickets(filter_groups, CLOSED_TICKET_PROPERTIES)
-
-
-def ticket_sla_outcome(props):
-    """Returns (met_sla_raw_or_None, met_sla_adjusted_or_None,
-    has_adjusted_target). met_sla_raw comes straight from HubSpot's own
-    field - untouched. met_sla_adjusted is None when the ticket has no
-    SLA target at all (e.g. Long Term Action (No SLA) ticket type),
-    which excludes it from the adjusted denominator rather than counting
-    it as a miss."""
-    raw_value = props.get("time_to_close__met_sla")
-    met_raw = None if raw_value is None else (raw_value == "true" or raw_value is True)
-
-    sla_target_at = parse_hubspot_epoch_ms(props.get("hs_time_to_close_sla_at"))
-    created_at = parse_hubspot_epoch_ms(props.get("createdate"))
-    time_to_close = props.get("time_to_close")
-    time_to_close = int(time_to_close) if time_to_close not in (None, "") else None
-
-    if sla_target_at is None or created_at is None or time_to_close is None:
-        return met_raw, None, False
-
-    other_team_ms = 0
-    for field in OTHER_TEAM_TIME_FIELDS:
-        val = props.get(field)
-        if val not in (None, ""):
-            other_team_ms += int(val)
-
-    adjusted_time_to_close = max(0, time_to_close - other_team_ms)
-    sla_target_ms = sla_target_at - created_at
-    met_adjusted = adjusted_time_to_close <= sla_target_ms
-    return met_raw, met_adjusted, True
+    rows = [
+        {
+            "ticket_id": t["ticket_id"],
+            "scope": scope,
+            "subject": t["subject"],
+            "stage_bucket": t["bucket"],
+            "stage_label": t["stage_label"],
+            "days_open": t["days_open"],
+            "updated_at": dt.datetime.utcnow().isoformat(),
+        }
+        for t in open_tickets
+    ]
+    insert_resp = requests.post(
+        delete_url,
+        headers={**supabase_headers(), "Prefer": "resolution=merge-duplicates"},
+        json=rows,
+        timeout=30,
+    )
+    insert_resp.raise_for_status()
+    print(f"Replaced open-detail rows for '{scope}': {len(rows)} open ticket(s).")
 
 
-def blocker_hours_for_ticket(props):
-    """Returns {bucket_key: hours} for all 6 blocker stages on one
-    ticket, converting HubSpot's millisecond cumulative-time fields to
-    hours. Missing/blank fields count as 0 (ticket never sat there)."""
-    hours = {}
-    for key, field in BLOCKER_STAGE_FIELDS.items():
-        val = props.get(field)
-        ms = int(val) if val not in (None, "") else 0
-        hours[key] = ms / 3_600_000
-    return hours
+def sync_open_snapshots(dry_run=False):
+    """Runs the live open-ticket snapshot (both the bucket-count table and
+    the per-ticket detail table) for the team total plus each person.
+    Always overwrites - nothing here is locked, and there's no month_key
+    at all, since this is a 'right now' number. Safe to run every time
+    this script runs. In dry-run mode, computes and prints everything but
+    writes nothing to Supabase."""
+    all_open = []
+    for owner_id, owner_name in OWNERS.items():
+        open_tickets = open_tickets_for_owner(owner_id)
+        all_open.extend(open_tickets)
+        if dry_run:
+            print(f"[DRY RUN] '{owner_name}': {len(open_tickets)} open ticket(s), "
+                  f"buckets={bucket_open_tickets(open_tickets)}")
+        else:
+            upsert_open_buckets(owner_name, open_tickets)
+            replace_open_detail(owner_name, open_tickets)
 
-
-def top_blocker(total_hours):
-    """Given {bucket_key: total_hours} summed across a month's closed
-    tickets, returns (label, hours) for whichever stage ate the most
-    time, or (None, 0) if nothing in any blocker stage this month."""
-    best_key, best_hours = None, 0.0
-    for key, hours in total_hours.items():
-        if hours > best_hours:
-            best_key, best_hours = key, hours
-    if best_key is None:
-        return None, 0.0
-    return BLOCKER_LABELS[best_key], round(best_hours, 1)
-
-
-def aggregate_month(owner_id, owner_name, month_key):
-    tickets = fetch_closed_tickets_for_owner_month(owner_id, month_key)
-    tickets_closed = len(tickets)
-    within_sla = 0
-    within_sla_adjusted = 0
-    eligible_for_adjusted = 0
-    blocker_totals = {key: 0.0 for key in BLOCKER_STAGE_FIELDS}
-
-    for t in tickets:
-        props = t.get("properties", {})
-        met_raw, met_adjusted, has_target = ticket_sla_outcome(props)
-        if met_raw:
-            within_sla += 1
-        if has_target:
-            eligible_for_adjusted += 1
-            if met_adjusted:
-                within_sla_adjusted += 1
-
-        for key, hours in blocker_hours_for_ticket(props).items():
-            blocker_totals[key] += hours
-
-    blocker_label, blocker_hours = top_blocker(blocker_totals)
-
-    return {
-        "owner_name": owner_name,
-        "tickets_closed": tickets_closed,
-        "within_sla": within_sla,
-        "eligible_for_adjusted": eligible_for_adjusted,
-        "within_sla_adjusted": within_sla_adjusted,
-        "blocker_totals": blocker_totals,
-        "top_blocker": blocker_label,
-        "top_blocker_hours": blocker_hours,
-    }
+    if dry_run:
+        print(f"[DRY RUN] 'team': {len(all_open)} open ticket(s), "
+              f"buckets={bucket_open_tickets(all_open)}")
+    else:
+        upsert_open_buckets("team", all_open)
+        # No replace_open_detail("team", ...) - see its docstring: a
+        # ticket belongs to one owner, so "team" detail rows would just
+        # duplicate rows already written under that owner's name.
 
 
 # ---------------------------------------------------------------------------
@@ -440,39 +501,31 @@ def supabase_headers():
 
 
 def fetch_closed_months():
-    url = f"{SUPABASE_URL}/rest/v1/{SLA_TABLE}?select=month_key,status&scope=eq.team"
+    url = f"{SUPABASE_URL}/rest/v1/{TABLE}?select=month_key,status&scope=eq.team"
     resp = requests.get(url, headers=supabase_headers(), timeout=30)
     resp.raise_for_status()
     return {r["month_key"] for r in resp.json() if r["status"] == "closed"}
 
 
-def upsert_sla_row(month_key, scope, agg, status):
-    sla_pct = round(agg["within_sla"] / agg["tickets_closed"] * 100, 1) if agg["tickets_closed"] else None
-    sla_pct_adjusted = (
-        round(agg["within_sla_adjusted"] / agg["eligible_for_adjusted"] * 100, 1)
-        if agg["eligible_for_adjusted"] else None
-    )
+def upsert_row(month_key, scope, tickets_closed, eligible_closed, within_sla,
+               within_sla_adjusted, status):
+    # Both percentages are out of eligible_closed (tickets that actually
+    # had an SLA target), not tickets_closed - see owner_month_stats().
+    sla_pct = round(within_sla / eligible_closed * 100, 1) if eligible_closed else None
+    sla_pct_adjusted = round(within_sla_adjusted / eligible_closed * 100, 1) if eligible_closed else None
     payload = {
         "month_key": month_key,
-        "scope": scope,
-        "tickets_closed": agg["tickets_closed"],
-        "within_sla": agg["within_sla"],
+        "scope": scope,  # 'team' or one of 'Javiana' / 'Lucas' / 'Victoria'
+        "tickets_closed": tickets_closed,
+        "eligible_closed": eligible_closed,
+        "within_sla": within_sla,
         "sla_pct": sla_pct,
-        "eligible_for_adjusted": agg["eligible_for_adjusted"],
-        "within_sla_adjusted": agg["within_sla_adjusted"],
+        "within_sla_adjusted": within_sla_adjusted,
         "sla_pct_adjusted": sla_pct_adjusted,
-        "top_blocker": agg["top_blocker"],
-        "top_blocker_hours": agg["top_blocker_hours"],
-        "tech_hours": round(agg["blocker_totals"]["tech"], 1),
-        "finance_hours": round(agg["blocker_totals"]["finance"], 1),
-        "media_brand_hours": round(agg["blocker_totals"]["media_brand"], 1),
-        "innova_hours": round(agg["blocker_totals"]["innova"], 1),
-        "cs_feedback_hours": round(agg["blocker_totals"]["cs_feedback"], 1),
-        "hotel_client_hours": round(agg["blocker_totals"]["hotel_client"], 1),
         "status": status,
         "updated_at": dt.datetime.utcnow().isoformat(),
     }
-    url = f"{SUPABASE_URL}/rest/v1/{SLA_TABLE}"
+    url = f"{SUPABASE_URL}/rest/v1/{TABLE}"
     resp = requests.post(
         url,
         headers={**supabase_headers(), "Prefer": "resolution=merge-duplicates"},
@@ -498,19 +551,7 @@ def month_key_n_back(n):
     return f"{year:04d}-{month:02d}"
 
 
-def run_open_buckets(dry_run=False):
-    tickets = fetch_open_tickets_for_owners(OWNERS.keys())
-    counts = compute_open_buckets(tickets)
-    if dry_run:
-        print("[DRY RUN] Would upsert open buckets:")
-        for scope, bucket_counts in counts.items():
-            print(f"  {scope}: {bucket_counts}")
-        return
-    for scope, bucket_counts in counts.items():
-        upsert_open_buckets(scope, bucket_counts)
-
-
-def run_monthly_sla(force_months=None, dry_run=False):
+def main(force_months=None, dry_run=False):
     force_months = set(force_months or [])
     current_month_key = month_key_n_back(0)
     wanted_months = [month_key_n_back(n) for n in range(TRAILING_MONTHS + 1)]
@@ -521,51 +562,39 @@ def run_monthly_sla(force_months=None, dry_run=False):
             continue  # locked
 
         status = "current" if month_key == current_month_key else "closed"
-        team_scalars = {"tickets_closed": 0, "within_sla": 0, "eligible_for_adjusted": 0, "within_sla_adjusted": 0}
-        team_blocker_totals = {key: 0.0 for key in BLOCKER_STAGE_FIELDS}
+        team_closed = 0
+        team_eligible = 0
+        team_within = 0
+        team_within_adjusted = 0
 
         for owner_id, owner_name in OWNERS.items():
-            agg = aggregate_month(owner_id, owner_name, month_key)
-            if dry_run:
-                print(f"[DRY RUN] {month_key} / {owner_name} ({status}): {agg}")
-            else:
-                upsert_sla_row(month_key, owner_name, agg, status)
-            for key in team_scalars:
-                team_scalars[key] += agg[key]
-            for key in team_blocker_totals:
-                team_blocker_totals[key] += agg["blocker_totals"][key]
+            closed, eligible, within, within_adjusted = owner_month_stats(owner_id, month_key)
+            upsert_row(month_key, owner_name, closed, eligible, within, within_adjusted, status)
+            team_closed += closed
+            team_eligible += eligible
+            team_within += within
+            team_within_adjusted += within_adjusted
 
-        # Team's top blocker is recomputed from the SUMMED totals, not
-        # derived from the three owners' individual top blockers - e.g.
-        # if Javiana's top is Tech and Lucas's top is Innova, the team's
-        # top could legitimately be either one, or something else
-        # entirely once all three are added together.
-        team_blocker_label, team_blocker_hours = top_blocker(team_blocker_totals)
-        team_agg = {
-            **team_scalars,
-            "blocker_totals": team_blocker_totals,
-            "top_blocker": team_blocker_label,
-            "top_blocker_hours": team_blocker_hours,
-        }
+        upsert_row(month_key, "team", team_closed, team_eligible, team_within,
+                   team_within_adjusted, status)
 
-        if dry_run:
-            print(f"[DRY RUN] {month_key} / team ({status}): {team_agg}")
-        else:
-            upsert_sla_row(month_key, "team", team_agg, status)
-
-
-def main(force_months=None, dry_run=False):
-    run_open_buckets(dry_run=dry_run)
-    run_monthly_sla(force_months=force_months, dry_run=dry_run)
+    # Live "currently open" snapshot for the new Tickets Still Open panel -
+    # its own table, no month_key, always overwritten. See
+    # sync_open_snapshots()'s docstring and the ASSUMPTIONS note above
+    # OPEN_BUCKETS_TABLE. Only this step honors --dry-run; the monthly
+    # backfill above always writes, matching this script's existing
+    # (pre-this-change) behavior so as not to change production semantics
+    # for a step that wasn't part of this request.
+    sync_open_snapshots(dry_run=dry_run)
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument("months", nargs="*",
+                         help="Force-recompute specific already-closed months, e.g. 2026-08 2026-07.")
     parser.add_argument("--dry-run", action="store_true",
-                         help="No Supabase writes - just prints what would happen.")
-    parser.add_argument("--month", type=str, action="append", default=None,
-                         help="Force-recompute a specific already-closed month (e.g. 2026-07). Repeatable.")
+                         help="Print what the open-ticket snapshot would write, without writing it. "
+                              "Only affects the open-ticket snapshot step.")
     args = parser.parse_args()
-
-    main(force_months=args.month, dry_run=args.dry_run)
+    main(force_months=args.months, dry_run=args.dry_run)
