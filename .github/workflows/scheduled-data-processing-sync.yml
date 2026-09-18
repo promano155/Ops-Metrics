@@ -2,6 +2,17 @@ name: scheduled-data-processing-sync
 
 on:
   workflow_dispatch:
+    inputs:
+      force_month:
+        description: >
+          Optional: a REPORTING month key (e.g. 2026-09) to force-recompute
+          even if it's already locked/closed - overrides the freeze on
+          eligible_files/sent_within_7bd/rate_pct/status for that one month.
+          Leave blank for a normal run (recomputes only the still-open
+          month, patches total_files_sent on locked months, same as every
+          other dispatch does).
+        required: false
+        default: ""
 
 jobs:
   run:
@@ -17,4 +28,16 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: python sync_data_processing_metrics.py
+          FORCE_MONTH: ${{ github.event.inputs.force_month }}
+        # cron-job.org's daily hit to this dispatch endpoint sends no
+        # inputs, so FORCE_MONTH is empty and this runs with no argument -
+        # identical to today's behavior. A manual "Run workflow" click with
+        # the force_month box filled in appends it as the CLI arg the
+        # script already knows how to use (see its __main__ block:
+        # positional args are REPORTING labels to force-recompute).
+        run: |
+          if [ -n "$FORCE_MONTH" ]; then
+            python sync_data_processing_metrics.py "$FORCE_MONTH"
+          else
+            python sync_data_processing_metrics.py
+          fi
