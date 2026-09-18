@@ -99,7 +99,6 @@ frozen forever at whatever they were the moment the window closed.
 
 import os
 import re
-import sys
 import json
 import time
 import calendar
@@ -535,7 +534,7 @@ def fetch_existing_month_keys(status_filter=None):
     return {r["month_key"] for r in rows}
 
 
-def upsert_month(month_key, agg, total_files_sent, status):
+def upsert_month(month_key, agg, total_files_sent, status, dry_run=False):
     """Full-row write. Only ever called for a month that is NOT yet
     SLA-locked (status='current') or the very first time a month
     transitions to 'closed' - both of those are legitimate moments to
@@ -545,7 +544,10 @@ def upsert_month(month_key, agg, total_files_sent, status):
     total_files_sent is passed in explicitly (from
     total_files_sent_by_send_month()), NOT read off agg - it's grouped
     by Send Date's calendar month, a different axis than agg's
-    billing-period grouping."""
+    billing-period grouping.
+
+    dry_run=True prints the payload that WOULD be written and returns
+    without making any Supabase call at all."""
     rate = (agg.sent_within_sla / agg.eligible_files * 100) if agg.eligible_files else None
     payload = {
         "month_key": month_key,
@@ -556,6 +558,9 @@ def upsert_month(month_key, agg, total_files_sent, status):
         "status": status,
         "updated_at": dt.datetime.utcnow().isoformat(),
     }
+    if dry_run:
+        print(f"[DRY RUN] Would upsert {month_key} ({status}): {payload}")
+        return
     # on_conflict=month_key: month_key is confirmed to be the table's
     # actual primary key (checked directly via pg_get_constraintdef), so
     # this is just making that explicit rather than fixing a real bug -
@@ -571,7 +576,7 @@ def upsert_month(month_key, agg, total_files_sent, status):
     print(f"Upserted {month_key} ({status}): {payload}")
 
 
-def patch_total_files_sent(month_key, total_files_sent):
+def patch_total_files_sent(month_key, total_files_sent, dry_run=False):
     """total_files_sent is a genuinely different metric from the SLA
     trio (eligible_files/sent_within_7bd/rate_pct), and grouped on a
     different axis entirely: "how many invoices, from ANY billing
@@ -590,7 +595,13 @@ def patch_total_files_sent(month_key, total_files_sent):
     late) and would silently un-freeze exactly what sla_window_closed()
     exists to protect. This does a narrow PATCH touching only
     total_files_sent and updated_at, leaving status and the three SLA
-    columns exactly as they were the moment this month locked."""
+    columns exactly as they were the moment this month locked.
+
+    dry_run=True prints what WOULD be patched and returns without
+    making any Supabase call at all."""
+    if dry_run:
+        print(f"[DRY RUN] Would patch total_files_sent for locked month {month_key}: {total_files_sent}")
+        return
     url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?month_key=eq.{month_key}"
     payload = {
         "total_files_sent": total_files_sent,
@@ -599,6 +610,80 @@ def patch_total_files_sent(month_key, total_files_sent):
     resp = requests.patch(url, headers=supabase_headers(), json=payload, timeout=30)
     resp.raise_for_status()
     print(f"Patched total_files_sent for locked month {month_key}: {total_files_sent}")
+
+
+def list_rows_for_billing_period(spreadsheet, billing_period):
+    """Diagnostic ONLY - makes no Supabase calls at all, read-only
+    against the sheet. Prints every row found (across all worksheets)
+    whose Billing Period Analyzed cell matches billing_period, with
+    enough detail to manually verify eligibility/SLA/sent-month
+    determinations by eye against whatever Supabase ends up showing.
+    billing_period is a BILLING PERIOD (e.g. '2026-07'), not a reporting
+    label - August's reporting month is built from July's billing
+    period, so pass '2026-07' to inspect what feeds August's row."""
+
+    def _cell(row, idx):
+        if idx is None or idx >= len(row):
+            return ""
+        return row[idx]
+
+    hotel_aliases = ["Hotel Name", "Hotel"]
+    found = 0
+
+    for ws in spreadsheet.worksheets():
+        try:
+            values = get_all_values_with_retry(ws)
+        except Exception as e:
+            print(f"SKIPPING worksheet '{ws.title}' after retries failed: {e}")
+            continue
+        if not values:
+            continue
+
+        headers = values[0]
+        col_period = find_col_index(headers, "billing_period")
+        if col_period is None:
+            continue
+        col_uploaded = find_col_index(headers, "data_uploaded_flag")
+        col_upload_date = find_col_index(headers, "upload_date")
+        col_sent_flag = find_col_index(headers, "results_sent_flag")
+        col_send_date = find_col_index(headers, "send_date")
+
+        normalized_headers = [normalize(h) for h in headers]
+        col_hotel = None
+        for alias in hotel_aliases:
+            if normalize(alias) in normalized_headers:
+                col_hotel = normalized_headers.index(normalize(alias))
+                break
+
+        for row in values[1:]:
+            if len(row) <= col_period:
+                continue
+            parsed_period = parse_billing_period(row[col_period])
+            if not parsed_period or parsed_period[0] != billing_period:
+                continue
+
+            found += 1
+            year = parsed_period[1]
+            hotel = _cell(row, col_hotel) or "(no hotel name column found)"
+
+            uploaded_flag = is_truthy(_cell(row, col_uploaded)) if col_uploaded is not None else bool(_cell(row, col_upload_date))
+            upload_date = parse_date(_cell(row, col_upload_date), year)
+            sent_flag = is_truthy(_cell(row, col_sent_flag)) if col_sent_flag is not None else bool(_cell(row, col_send_date))
+            send_date = parse_date(_cell(row, col_send_date), year)
+
+            elapsed = business_days_elapsed(upload_date, send_date) if (upload_date and send_date) else None
+            eligible = bool(uploaded_flag and upload_date is not None)
+            met_sla = bool(eligible and sent_flag and send_date is not None
+                           and elapsed is not None and elapsed <= BUSINESS_DAY_SLA)
+            send_month = f"{send_date.year:04d}-{send_date.month:02d}" if send_date else None
+
+            print(
+                f"[{ws.title}] {hotel} | uploaded={uploaded_flag} upload_date={upload_date} | "
+                f"sent={sent_flag} send_date={send_date} send_month={send_month} | "
+                f"elapsed_business_days={elapsed} | eligible={eligible} met_sla={met_sla}"
+            )
+
+    print(f"\n{found} row(s) found for billing period {billing_period}.")
 
 
 # ---------------------------------------------------------------------------
@@ -629,7 +714,16 @@ def shift_month_key(month_key, n):
     return f"{year:04d}-{month + 1:02d}"
 
 
-def main(force_months=None):
+def main(force_months=None, dry_run=False, list_rows_billing_period=None):
+    if list_rows_billing_period:
+        # Diagnostic mode overrides everything else - read-only, no
+        # Supabase calls, exits after printing. Matches the workflow's
+        # own description: "Overrides dry_run/force_month when set."
+        gc = get_gspread_client()
+        spreadsheet = gc.open_by_key(SHEET_ID)
+        list_rows_for_billing_period(spreadsheet, list_rows_billing_period)
+        return
+
     force_months = set(force_months or [])  # these are REPORTING labels, e.g. '2026-08'
     wanted_billing_periods = [month_key_n_back(n) for n in range(TRAILING_MONTHS + 1)]
     wanted_report_months = [shift_month_key(bp, 1) for bp in wanted_billing_periods]
@@ -661,7 +755,7 @@ def main(force_months=None):
             # period - keep recomputing/overwriting daily. Deliberately
             # NOT tied to current_billing_period/calendar-month rollover
             # anymore - see sla_window_closed()'s docstring for why.
-            upsert_month(report_month_key, agg, total_sent, status="current")
+            upsert_month(report_month_key, agg, total_sent, status="current", dry_run=dry_run)
         elif report_month_key in already_closed and report_month_key not in force_months:
             # SLA-locked: eligible_files/sent_within_7bd/rate_pct/status
             # must not change again. total_files_sent is a separate,
@@ -671,15 +765,32 @@ def main(force_months=None):
             # and patch_total_files_sent()'s docstrings - so it's the
             # only thing that gets touched here, via a narrow PATCH
             # rather than a full upsert.
-            patch_total_files_sent(report_month_key, total_sent)
+            patch_total_files_sent(report_month_key, total_sent, dry_run=dry_run)
         else:
-            upsert_month(report_month_key, agg, total_sent, status="closed")
+            upsert_month(report_month_key, agg, total_sent, status="closed", dry_run=dry_run)
 
 
 if __name__ == "__main__":
-    # Optional: python sync_data_processing_metrics.py 2026-08 2026-07
-    # forces a recompute of specific already-closed months. These are
-    # REPORTING labels (what you see on the dashboard), not billing
-    # periods - e.g. pass '2026-08' to force-recompute August's row,
-    # which is built from July's billing-period tab.
-    main(force_months=sys.argv[1:])
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("positional_months", nargs="*", default=[],
+                         help="Backward-compatible bare month args, e.g. 2026-08 2026-07 - "
+                              "treated identically to repeated --month flags.")
+    parser.add_argument("--month", action="append", dest="force_months", default=[],
+                         help="Force-recompute this already-closed REPORTING month (e.g. 2026-08), "
+                              "overriding its freeze. Repeatable: --month 2026-08 --month 2026-01.")
+    parser.add_argument("--dry-run", action="store_true",
+                         help="Print what would be written without writing it. Reads (fetching "
+                              "existing month keys, reading the sheet) still happen normally.")
+    parser.add_argument("--list-rows", dest="list_rows_billing_period", default=None,
+                         help="Diagnostic only: print every row found for this BILLING PERIOD "
+                              "(e.g. 2026-07 for August's reporting month), then exit. Read-only - "
+                              "makes no Supabase calls. Overrides --dry-run/--month when set.")
+    args = parser.parse_args()
+
+    all_force_months = list(args.force_months) + list(args.positional_months)
+    main(
+        force_months=all_force_months,
+        dry_run=args.dry_run,
+        list_rows_billing_period=args.list_rows_billing_period,
+    )
