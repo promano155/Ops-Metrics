@@ -418,9 +418,35 @@ def extract_all_aggregates(spreadsheet, billing_periods_wanted, report_months_wa
 
     Reference year for parsing no-year date values (both Upload Date and
     Send Date) always comes from the row's own Billing Period Analyzed
-    cell - neither date field is assumed to carry a year on its own."""
+    cell - neither date field is assumed to carry a year on its own.
+
+    FIXED: total_files_sent only needs Billing Period + Sent flag + Send
+    Date - it never reads Upload Date at all. An earlier version of this
+    function required ALL of col_period/col_upload_date/col_send_date to
+    even consider a row (a leftover from when the two metrics were
+    separate functions with separate, appropriately-scoped requirements),
+    which silently dropped rows from total_files_sent that were perfectly
+    valid for it but happened to be missing/blank in Upload Date. This
+    combined with get_all_values() omitting TRAILING blank cells - a row
+    whose last populated-looking column trails off blank comes back
+    shorter than the header row - meant a row complete for "was this
+    sent" but blank in a trailing Upload Date column got treated as
+    invalid and skipped entirely, undercounting total_files_sent. See
+    _cell() below: the two metrics now have independent minimum column
+    requirements, and a short row is read as "blank in that column," not
+    "skip this whole row.\""""
     aggs = {mk: MonthAgg() for mk in billing_periods_wanted}
     sent_by_month = {mk: 0 for mk in report_months_wanted}
+
+    def _cell(row, idx):
+        """Safe column access. A row can be legitimately shorter than
+        the header row (trailing blank cells get dropped by
+        get_all_values()) without any of its actually-populated columns
+        being invalid - returns '' for a missing/out-of-range column
+        instead of the caller having to skip the whole row."""
+        if idx is None or idx >= len(row):
+            return ""
+        return row[idx]
 
     for ws in spreadsheet.worksheets():
         try:
@@ -438,24 +464,33 @@ def extract_all_aggregates(spreadsheet, billing_periods_wanted, report_months_wa
         col_sent_flag = find_col_index(headers, "results_sent_flag")
         col_send_date = find_col_index(headers, "send_date")
 
-        # Skip tabs that don't have the columns we need at all (reference
-        # tabs like "Go Live Fees", contact directories, etc.)
-        if col_period is None or col_upload_date is None or col_send_date is None:
+        # A tab needs a Billing Period column to contribute to EITHER
+        # metric - everything is grouped off of it, one way or another.
+        # Reference tabs (contact directories, Go Live Fees, etc.) that
+        # lack it entirely are skipped here.
+        if col_period is None:
+            continue
+        # Beyond that, the two metrics have INDEPENDENT minimum
+        # requirements - a tab missing Upload Date can still contribute
+        # to total_files_sent (which never reads it), and a tab missing
+        # Send Date can still contribute eligible_files (though not
+        # sent_within_sla). Only skip entirely if neither metric has
+        # what it needs.
+        if col_upload_date is None and col_send_date is None:
             continue
 
         for row in values[1:]:
-            if len(row) <= max(col_period, col_upload_date, col_send_date):
+            if len(row) <= col_period:
                 continue
-            period_raw = row[col_period]
-            parsed_period = parse_billing_period(period_raw)
+            parsed_period = parse_billing_period(row[col_period])
             if not parsed_period:
                 continue
             billing_month_key, year = parsed_period
 
-            uploaded_flag = is_truthy(row[col_uploaded]) if col_uploaded is not None else bool(row[col_upload_date])
-            upload_date = parse_date(row[col_upload_date], year)
-            sent_flag = is_truthy(row[col_sent_flag]) if col_sent_flag is not None else bool(row[col_send_date])
-            send_date = parse_date(row[col_send_date], year)
+            uploaded_flag = is_truthy(_cell(row, col_uploaded)) if col_uploaded is not None else bool(_cell(row, col_upload_date))
+            upload_date = parse_date(_cell(row, col_upload_date), year)
+            sent_flag = is_truthy(_cell(row, col_sent_flag)) if col_sent_flag is not None else bool(_cell(row, col_send_date))
+            send_date = parse_date(_cell(row, col_send_date), year)
 
             # --- eligible_files / sent_within_sla: grouped by BILLING PERIOD ---
             if billing_month_key in aggs:
