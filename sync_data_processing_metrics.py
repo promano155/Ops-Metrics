@@ -217,17 +217,105 @@ def parse_billing_period(value):
     return f"{year:04d}-{month:02d}", year
 
 
+def _nth_weekday_of_month(year, month, weekday, n):
+    """The date of the nth occurrence of `weekday` (Monday=0...Sunday=6)
+    in the given month/year. n=-1 means the LAST occurrence (used for
+    Memorial Day, which is defined as the last Monday of May, not a
+    fixed ordinal one)."""
+    if n > 0:
+        d = dt.date(year, month, 1)
+        offset = (weekday - d.weekday()) % 7
+        d += dt.timedelta(days=offset)
+        d += dt.timedelta(weeks=n - 1)
+        return d
+    last_day = calendar.monthrange(year, month)[1]
+    d = dt.date(year, month, last_day)
+    offset = (d.weekday() - weekday) % 7
+    d -= dt.timedelta(days=offset)
+    return d
+
+
+def _observed(holiday_date):
+    """OPM's observed-date rule for a FIXED-date federal holiday: if it
+    falls on a Saturday, federal offices observe it the preceding
+    Friday; if it falls on a Sunday, the following Monday. Only applies
+    to fixed-date holidays (New Year's, Juneteenth, Independence Day,
+    Veterans Day, Christmas) - the floating ones (MLK Day, Presidents'
+    Day, Memorial Day, Labor Day, Columbus Day, Thanksgiving) are
+    already defined as a specific weekday and never need shifting."""
+    if holiday_date.weekday() == 5:  # Saturday
+        return holiday_date - dt.timedelta(days=1)
+    if holiday_date.weekday() == 6:  # Sunday
+        return holiday_date + dt.timedelta(days=1)
+    return holiday_date
+
+
+_FEDERAL_HOLIDAY_CACHE = {}
+
+
+def federal_holidays(year):
+    """The 11 standard US federal holidays for a given calendar year,
+    with observed-date shifting applied to the fixed-date ones. This is
+    the STANDARD OPM list only - no Curacity-specific additions (a
+    shutdown week, day-after-Thanksgiving, etc.). If any should be
+    layered on top, add them here explicitly with a comment explaining
+    why, rather than folding them silently into this list."""
+    if year not in _FEDERAL_HOLIDAY_CACHE:
+        _FEDERAL_HOLIDAY_CACHE[year] = {
+            _observed(dt.date(year, 1, 1)),         # New Year's Day
+            _nth_weekday_of_month(year, 1, 0, 3),    # MLK Day (3rd Mon, Jan)
+            _nth_weekday_of_month(year, 2, 0, 3),    # Presidents' Day (3rd Mon, Feb)
+            _nth_weekday_of_month(year, 5, 0, -1),   # Memorial Day (last Mon, May)
+            _observed(dt.date(year, 6, 19)),         # Juneteenth
+            _observed(dt.date(year, 7, 4)),          # Independence Day
+            _nth_weekday_of_month(year, 9, 0, 1),    # Labor Day (1st Mon, Sep)
+            _nth_weekday_of_month(year, 10, 0, 2),   # Columbus Day (2nd Mon, Oct)
+            _observed(dt.date(year, 11, 11)),        # Veterans Day
+            _nth_weekday_of_month(year, 11, 3, 4),   # Thanksgiving (4th Thu, Nov)
+            _observed(dt.date(year, 12, 25)),        # Christmas
+        }
+    return _FEDERAL_HOLIDAY_CACHE[year]
+
+
+def _holidays_spanning(start_date, end_date):
+    """Federal holidays for every calendar year touched by [start_date,
+    end_date] - almost always one year, but a date range that crosses a
+    Dec 31 -> Jan 1 boundary needs both."""
+    holidays = set()
+    for y in range(start_date.year, end_date.year + 1):
+        holidays |= federal_holidays(y)
+    return holidays
+
+
 def business_days_elapsed(start_date, end_date):
     """Count weekday-only business days strictly after start_date through
-    end_date inclusive. Returns None if inputs are missing or out of order."""
+    end_date inclusive, EXCLUDING the 11 standard US federal holidays
+    (see federal_holidays()). Returns None if inputs are missing or out
+    of order.
+
+    This is used both for the row-level "was this sent within 7 business
+    days" check AND for sla_window_closed()'s lock-timing calculation -
+    a holiday within either date range now correctly adds a day, in both
+    places, since they share this one implementation.
+
+    IMPORTANT: this changes results for ANY date range that spans a
+    federal holiday, compared to the weekends-only version this replaced.
+    A month already frozen (status='closed') is NOT retroactively
+    recomputed by this change - it stays exactly as reported, by design.
+    If a recently-locked month's window overlapped a holiday under the
+    OLD weekends-only logic, its frozen numbers were computed with an
+    incomplete business-day definition; force-recompute it via the CLI
+    month-key argument if that materially affected it - see the module
+    docstring's locking section for how."""
     if start_date is None or end_date is None:
         return None
     if end_date < start_date:
         return None
+    holidays = _holidays_spanning(start_date, end_date)
     days = 0
     current = start_date + dt.timedelta(days=1)
     while current <= end_date:
-        if current.weekday() < 5:  # Mon-Fri
+        if current.weekday() < 5 and current not in holidays:  # Mon-Fri, not a holiday
             days += 1
         current += dt.timedelta(days=1)
     return days
