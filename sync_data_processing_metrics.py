@@ -6,80 +6,108 @@ Google Sheet, computes the "7 business day" data-processing SLA metrics
 per billing month, and upserts the results into Supabase so the Lovable
 dashboard can read them instead of relying on manual entry.
 
-Run daily via GitHub Actions (see scheduled-data-processing-sync.yml).
+Run daily via GitHub Actions (see data-processing-sync.yml).
 
---- Design notes / assumptions ---
-1. "Eligible files" = rows where the Data Uploaded flag is Yes/TRUE AND
-   an Upload Date is present, AND that Upload Date falls on/before this
-   month's SLA cutoff (see point 2 - a file uploaded after the window
-   already closed was never part of this cohort), AND the hotel's
-   Status is not "Cancelling" (confirmed 2026-08-25: a departing account
-   shouldn't count against the active-account SLA rate). Blocklist on
-   Status, not an allowlist of "Live" specifically, since other valid
-   status values may exist on tabs not yet seen.
-
-2. "Sent within 7 business days" = rows where the Results Sent flag is
-   Yes/TRUE AND the Send Date falls on/after the 1st and on/before the
-   7th business day of the REPORTING month (the month the actual
-   processing work happens in - see point 6), counting that month's 1st
-   business day as day 1. This is a FIXED cutoff for the whole cohort,
-   not a rolling per-row clock starting on each file's own Upload Date -
-   confirmed 2026-08-25. It is also deliberately INDEPENDENT of the
-   Data Uploaded flag and Upload Date (i.e. independent of "eligible
-   files" above) - confirmed 2026-08-25: those get left unchecked/blank
-   sometimes even when a file genuinely was uploaded and sent on time,
-   and that shouldn't suppress a real on-time send from counting. This
-   means sent_within_sla is NOT guaranteed to be a subset of
-   eligible_files, and rate_pct (sent_within_sla / eligible_files) can
-   in principle exceed 100% if sheet data is incomplete elsewhere -
-   that's a visible symptom worth investigating in the sheet, not a
-   bug in this calculation. Business days = Mon-Fri, EXCLUDING US
-   federal holidays (confirmed 2026-08-31 - previously weekends only).
-3. "Total files sent" (previous-month closed card) = count of rows in that
-   month where the Results Sent flag is Yes/TRUE, regardless of how long it
-   took. This is a different, broader number than "sent within 7 days."
+--- Design notes / assumptions (confirm these match reality before trusting numbers) ---
+1. "Eligible files" = rows where the Data Uploaded flag is Yes/TRUE AND an
+   Upload Date is present.
+2. "Sent within 7 business days" = eligible rows where a Send Date is present
+   AND the number of weekday-only business days between Upload Date and
+   Send Date is <= 7. Business days = Mon-Fri, no holiday calendar applied.
+   If you observe federal holidays in your SLA, tell me and I'll add a
+   holiday list.
+3. "Total files sent" = count of rows in that billing period where the
+   Results Sent flag is Yes/TRUE, regardless of how long it took. This is
+   a deliberately different, ONGOING metric from "sent within 7 days" -
+   confirmed directly, not a bug: it keeps climbing all month as backlog
+   clears, even after that billing period's SLA window (point 5) has
+   locked. See point 5 and patch_total_files_sent() for how it stays live
+   independently of the frozen SLA fields.
 4. Column names have drifted across tabs over the years, so columns are
    matched by ALIAS, not fixed position. If a future tab renames a column
    again, add the new name to COLUMN_ALIASES below rather than touching the
    parsing logic.
-5. Locking: the current REPORTING month (one month ahead of whichever
-   billing period is actively being worked - see point 6) is recomputed
-   and overwritten every run. Any earlier reporting month is written
-   ONCE (status='closed') and never silently overwritten again, even if
-   the underlying sheet is edited later. To force a recompute of a
-   closed month, pass its REPORTING label (e.g. '2026-08') as a
-   --month arg, repeatable.
+5. Locking: eligible_files/sent_within_7bd/rate_pct/status lock together,
+   permanently, the moment sla_window_closed() says a billing period's
+   7-business-day window has closed for every possible row in it (see
+   point 6 and the FIXED note below for why this is NOT simply "once the
+   calendar rolls to next month"). Once locked, those four fields are
+   never silently overwritten again, even if the underlying sheet is
+   edited later - this protects numbers that have already been reported
+   out. total_files_sent is the one exception: it keeps being refreshed
+   on every run via a narrow PATCH (patch_total_files_sent()), forever,
+   because it's an intentionally ongoing count, not a frozen SLA outcome.
+   To force a full recompute of an already-locked month (overriding the
+   freeze on all four fields, not just total_files_sent), pass its
+   REPORTING label (e.g. '2026-08') as a CLI arg, or delete its row from
+   the Supabase table.
 6. Billing period vs. reporting label: the tab this reads is named for
    its billing period (July's billing period tab has rows dated
    '7.1.26 - 7.31.26'), but the actual WORK of processing that billing
    period happens the following month (July's invoices are processed in
    August). This script reads and locates data by the billing period
-   exactly as labeled in the sheet, but stores and displays the result
-   under a REPORTING label one month later.
-7. parse_billing_period takes the LAST date match in a range string, not
-   the first - confirmed 2026-08-26: multi-month catch-up/backfill
-   periods like '6.1.26 - 7.31.26' represent a correction that covers
-   several months but is processed/reported as part of the END month.
-   Taking the first date silently misfiled 12 real rows into the wrong
-   month before this fix. Same principle already used in
-   sync_yellow_rows_to_asana.py's parse_billing_period.
-8. Business-day math excludes US federal holidays as well as weekends -
-   confirmed 2026-08-31. Uses the `holidays` package (deterministic,
-   rule-based - e.g. "3rd Monday of January" for MLK Day - not any kind
-   of interpretation) rather than a hand-maintained date list that would
-   need updating every year.
+   exactly as labeled in the sheet - that part is unchanged - but stores
+   and displays the result under a REPORTING label one month later,
+   since "how fast did we process files" is a statement about the month
+   the work happened in, not the month being billed for.
+
+--- RULED OUT: duplicate-row theory ---
+Initially suspected upsert_month()'s merge-duplicates was matching against
+an unrelated primary key and silently inserting duplicate rows per month,
+causing nondeterministic reads. Confirmed via pg_get_constraintdef that
+month_key IS the table's primary key - merge-duplicates was correctly
+targeting it all along, so this was not the bug. on_conflict=month_key is
+still added explicitly below since it's harmless and makes the intent
+unambiguous, but it changes no actual behavior here.
+
+--- FIXED: the lock was tied to the wrong clock ---
+Previously a billing period stayed status='current' for the entire
+calendar month it was being actively worked in (via MONTH_OFFSET), and
+only locked once the calendar rolled to the NEXT month. But the actual
+7-business-day SLA window for a billing period closes much earlier than
+that: the latest possible Upload Date in, say, July is July 31, and 7
+business days after that is around August 10 - yet the old logic kept
+July's report recomputing and overwriting rate_pct/total_files_sent for
+three more weeks after that, purely because the calendar hadn't rolled
+into September. That's what produced a "closed" month's SLA % silently
+drifting (91.4% -> 90.8%) with no code bug and no duplicate rows involved
+- just real invoices continuing to work through the backlog after the
+window had already functionally closed.
+
+Fix: sla_window_closed() computes, per billing period, the actual date
+by which every possible row in it must have resolved (period end + 7
+business days), using the same business_days_elapsed() helper already
+used for the row-level SLA math. A billing period locks as soon as that
+date has passed, regardless of which calendar month we're in. This
+replaces the old current_billing_period/MONTH_OFFSET-based lock
+decision entirely - MONTH_OFFSET/month_key_n_back is still used to
+build the list of billing periods to scan, just not to decide locking.
+
+--- Locking eligible_files/sent_within_7bd/rate_pct is NOT the same as
+locking the whole row ---
+A first pass at this fix locked total_files_sent along with the SLA
+trio, on the theory that "once locked, nothing on this row should
+change." That's wrong for total_files_sent specifically - confirmed
+directly, it's meant to be a running "invoices sent this billing period"
+count that keeps growing indefinitely, independent of the SLA
+determination. So once a month locks: upsert_month() (full row write) is
+never called for it again; instead patch_total_files_sent() runs on
+every subsequent execution, touching only total_files_sent and
+updated_at. status, eligible_files, sent_within_7bd, and rate_pct are
+frozen forever at whatever they were the moment the window closed.
 """
 
 import os
 import re
+import sys
 import json
 import time
+import calendar
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import gspread
 import requests
-import holidays as holidays_lib
 from google.oauth2.service_account import Credentials
 
 # ---------------------------------------------------------------------------
@@ -88,6 +116,12 @@ from google.oauth2.service_account import Credentials
 
 SHEET_ID = "10osrvx4zsemAQy3rAci2tbV3cAzRBSM8ocecbnuw76I"
 
+# The workbook has 40+ monthly tabs. Reading each one with get_all_values()
+# in a tight loop reliably hits the Sheets API's per-minute read quota -
+# this caused a real incident where most tabs were silently skipped and
+# only one made it into Supabase. Every read is now retried with backoff
+# on rate-limit errors, and throttled up front to avoid hitting the wall
+# in the first place.
 SHEETS_REQUEST_DELAY_SECONDS = 1.1
 SHEETS_MAX_RETRIES = 5
 
@@ -95,22 +129,19 @@ SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 SUPABASE_TABLE = "data_processing_monthly_metrics"
 
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]  # raw JSON string secret
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
-TRAILING_MONTHS = 24
+TRAILING_MONTHS = 24  # how far back to backfill/consider for the trend line
 BUSINESS_DAY_SLA = 7
-MONTH_OFFSET = 1
+MONTH_OFFSET = 1  # the actively-worked tab is always the PREVIOUS calendar
+                  # month, not the current one - confirmed with the team.
+                  # e.g. in late July, the live/active tab is still June's.
 
-# Full US federal holiday calendar (11 days/year) - auto-expands to
-# whatever year is queried, computed via published rules, not a
-# hand-maintained list that goes stale.
-US_HOLIDAYS = holidays_lib.US()
-
+# Column name aliases. Matching is case-insensitive and ignores surrounding
+# whitespace. Add new observed variants here as the sheet evolves.
 COLUMN_ALIASES = {
     "billing_period": ["Billing Period Analyzed", "Period Being Analyzed"],
-    "hotel_name": ["Hotel Name", "Hotel"],
-    "status": ["Status"],
     "data_uploaded_flag": ["Data Uploaded (Yes/No)", "Data Uploaded"],
     "upload_date": ["Upload Date"],
     "results_sent_flag": [
@@ -123,7 +154,6 @@ COLUMN_ALIASES = {
 }
 
 TRUE_VALUES = {"yes", "true", "y"}
-EXCLUDED_STATUSES = {"cancelling"}  # normalized (lowercased/trimmed)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -161,6 +191,7 @@ def parse_date(value, reference_year):
             return dt.datetime.strptime(value, fmt).date()
         except ValueError:
             continue
+    # No-year format like "7/1" or "7/8"
     m = re.match(r"^(\d{1,2})/(\d{1,2})$", value)
     if m:
         month, day = int(m.group(1)), int(m.group(2))
@@ -172,19 +203,13 @@ def parse_date(value, reference_year):
 
 
 def parse_billing_period(value):
-    """Returns (month_key, year) from the END of a '{start} - {end}'
-    range - takes the LAST date match in the string, not the first.
-    Confirmed 2026-08-26: multi-month catch-up periods like
-    '6.1.26 - 7.31.26' represent a correction processed/reported as
-    part of the END month. Taking the last match (rather than strictly
-    the second) also correctly handles the rare compound cell that
-    concatenates more than one range in one string."""
+    """'6.1.26 - 6.30.26' -> (month_key='2026-06', year=2026)."""
     if not value:
         return None
-    matches = re.findall(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", value)
-    if not matches:
+    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", value)
+    if not m:
         return None
-    month, _day, year = matches[-1]
+    month, _day, year = m.groups()
     year = int(year)
     if year < 100:
         year += 2000
@@ -192,29 +217,52 @@ def parse_billing_period(value):
     return f"{year:04d}-{month:02d}", year
 
 
-def nth_business_day_of_month(year, month, n):
-    """Returns the date of the Nth business day (Mon-Fri, EXCLUDING US
-    federal holidays) of the given month, counting the 1st business day
-    as day 1 - inclusive. Confirmed 2026-08-31: holidays must be
-    excluded in addition to weekends - previously only weekends were
-    excluded, which understated the real number of calendar days
-    available and made the cutoff land a day too early whenever a
-    federal holiday fell inside the window."""
-    d = dt.date(year, month, 1)
-    count = 0
-    while True:
-        if d.weekday() < 5 and d not in US_HOLIDAYS:
-            count += 1
-            if count == n:
-                return d
-        d += dt.timedelta(days=1)
+def business_days_elapsed(start_date, end_date):
+    """Count weekday-only business days strictly after start_date through
+    end_date inclusive. Returns None if inputs are missing or out of order."""
+    if start_date is None or end_date is None:
+        return None
+    if end_date < start_date:
+        return None
+    days = 0
+    current = start_date + dt.timedelta(days=1)
+    while current <= end_date:
+        if current.weekday() < 5:  # Mon-Fri
+            days += 1
+        current += dt.timedelta(days=1)
+    return days
+
+
+def sla_window_closed(billing_period, today=None):
+    """True once the 7-business-day SLA window has definitively closed
+    for EVERY possible row in this billing period, regardless of which
+    calendar month we're currently in.
+
+    The latest possible Upload Date for a billing period is the last
+    calendar day of that period's month. Once BUSINESS_DAY_SLA business
+    days have elapsed since then, no row from this billing period could
+    still be legitimately "pending" inside its SLA window - each one has
+    already been sent in time, sent late, or not sent at all, and none
+    of those outcomes can change by waiting longer for THIS SLA
+    determination specifically (a hotel uploading months-late backdated
+    data for this period is a separate, accepted tradeoff - see the
+    module docstring's second FIXED note).
+
+    Reuses business_days_elapsed(), the same helper the row-level SLA
+    math uses, rather than a second date-walking implementation."""
+    if today is None:
+        today = dt.date.today()
+    year, month = (int(x) for x in billing_period.split("-"))
+    last_day = calendar.monthrange(year, month)[1]
+    period_end = dt.date(year, month, last_day)
+    elapsed = business_days_elapsed(period_end, today)
+    return elapsed is not None and elapsed >= BUSINESS_DAY_SLA
 
 
 @dataclass
 class MonthAgg:
     eligible_files: int = 0
     sent_within_sla: int = 0
-    total_files_sent: int = 0
     rows_seen: int = 0
 
 
@@ -223,12 +271,17 @@ class MonthAgg:
 # ---------------------------------------------------------------------------
 
 
-def get_credentials():
+def get_gspread_client():
     creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    return Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    return gspread.authorize(creds)
 
 
 def get_all_values_with_retry(ws):
+    """Reads a worksheet's values, retrying with backoff on rate-limit
+    errors instead of silently giving up. This is the fix for a real
+    incident where a plain try/except swallowed 429s across ~40 tabs and
+    only one tab's data ever made it into Supabase."""
     for attempt in range(SHEETS_MAX_RETRIES):
         try:
             values = ws.get_all_values()
@@ -247,24 +300,39 @@ def get_all_values_with_retry(ws):
     raise RuntimeError(f"Still rate limited reading '{ws.title}' after {SHEETS_MAX_RETRIES} retries")
 
 
-def shift_month_key(month_key, n):
-    """Shifts a 'YYYY-MM' key forward (or back, if n is negative) by n
-    months. Used to convert a BILLING PERIOD into a REPORTING label."""
-    year, month = (int(x) for x in month_key.split("-"))
-    total = year * 12 + (month - 1) + n
-    year, month = divmod(total, 12)
-    return f"{year:04d}-{month + 1:02d}"
+def relevant_worksheets(spreadsheet, cutoff_month_key):
+    """Returns worksheets worth scanning: anything whose title looks like a
+    month/year tab, without assuming an exact naming scheme (tab-naming has
+    drifted over the years). We filter by content (Billing Period column),
+    not by tab title, so this is robust to that drift."""
+    return spreadsheet.worksheets()
 
 
-def extract_month_aggregates(spreadsheet, months_wanted):
-    aggs = {mk: MonthAgg() for mk in months_wanted}
+def extract_all_aggregates(spreadsheet, billing_periods_wanted, report_months_wanted):
+    """Single pass over every worksheet, feeding TWO separate results
+    that group rows by two different keys - merged into one scan
+    specifically to avoid a second full read of all 40+ tabs, which is
+    exactly the kind of repeated-full-scan pattern that caused the rate-
+    limit incident get_all_values_with_retry() exists to guard against.
 
-    cutoffs = {}
-    window_starts = {}
-    for billing_period in months_wanted:
-        report_year, report_month = (int(x) for x in shift_month_key(billing_period, 1).split("-"))
-        cutoffs[billing_period] = nth_business_day_of_month(report_year, report_month, BUSINESS_DAY_SLA)
-        window_starts[billing_period] = dt.date(report_year, report_month, 1)
+    Returns (aggs, sent_by_month):
+      aggs: {billing_period_month_key: MonthAgg} - eligible_files/
+            sent_within_sla, grouped by which billing period a row
+            belongs to (its Billing Period Analyzed cell).
+      sent_by_month: {report_month_key: int} - total_files_sent,
+            grouped by the CALENDAR MONTH of a row's Send Date,
+            regardless of which billing period that row belongs to.
+            Confirmed directly: a July-billing-period invoice sent in
+            August counts toward August's total, not July's - this is a
+            different question from "of the invoices belonging to
+            billing period X, how many hit the 7-day target," so it
+            can't share aggs' grouping key.
+
+    Reference year for parsing no-year date values (both Upload Date and
+    Send Date) always comes from the row's own Billing Period Analyzed
+    cell - neither date field is assumed to carry a year on its own."""
+    aggs = {mk: MonthAgg() for mk in billing_periods_wanted}
+    sent_by_month = {mk: 0 for mk in report_months_wanted}
 
     for ws in spreadsheet.worksheets():
         try:
@@ -281,8 +349,9 @@ def extract_month_aggregates(spreadsheet, months_wanted):
         col_upload_date = find_col_index(headers, "upload_date")
         col_sent_flag = find_col_index(headers, "results_sent_flag")
         col_send_date = find_col_index(headers, "send_date")
-        col_status = find_col_index(headers, "status")
 
+        # Skip tabs that don't have the columns we need at all (reference
+        # tabs like "Go Live Fees", contact directories, etc.)
         if col_period is None or col_upload_date is None or col_send_date is None:
             continue
 
@@ -293,163 +362,31 @@ def extract_month_aggregates(spreadsheet, months_wanted):
             parsed_period = parse_billing_period(period_raw)
             if not parsed_period:
                 continue
-            month_key, year = parsed_period
-            if month_key not in aggs:
-                continue
-
-            agg = aggs[month_key]
-            agg.rows_seen += 1
+            billing_month_key, year = parsed_period
 
             uploaded_flag = is_truthy(row[col_uploaded]) if col_uploaded is not None else bool(row[col_upload_date])
             upload_date = parse_date(row[col_upload_date], year)
             sent_flag = is_truthy(row[col_sent_flag]) if col_sent_flag is not None else bool(row[col_send_date])
             send_date = parse_date(row[col_send_date], year)
-            status = normalize(row[col_status]) if (col_status is not None and len(row) > col_status) else ""
 
-            if (
-                uploaded_flag
-                and upload_date
-                and upload_date <= cutoffs[month_key]
-                and status not in EXCLUDED_STATUSES
-            ):
-                agg.eligible_files += 1
+            # --- eligible_files / sent_within_sla: grouped by BILLING PERIOD ---
+            if billing_month_key in aggs:
+                agg = aggs[billing_month_key]
+                agg.rows_seen += 1
+                if uploaded_flag and upload_date:
+                    agg.eligible_files += 1
+                    if sent_flag and send_date:
+                        elapsed = business_days_elapsed(upload_date, send_date)
+                        if elapsed is not None and elapsed <= BUSINESS_DAY_SLA:
+                            agg.sent_within_sla += 1
 
-            if sent_flag and send_date and window_starts[month_key] <= send_date <= cutoffs[month_key]:
-                agg.sent_within_sla += 1
+            # --- total_files_sent: grouped by SEND DATE's calendar month ---
+            if sent_flag and send_date is not None:
+                send_month_key = f"{send_date.year:04d}-{send_date.month:02d}"
+                if send_month_key in sent_by_month:
+                    sent_by_month[send_month_key] += 1
 
-            if sent_flag:
-                agg.total_files_sent += 1
-
-    return aggs
-
-
-# ---------------------------------------------------------------------------
-# Diagnostic (read-only, no Supabase calls)
-# ---------------------------------------------------------------------------
-
-
-def list_rows_for_billing_period(spreadsheet, target_billing_period):
-    report_year, report_month = (int(x) for x in shift_month_key(target_billing_period, 1).split("-"))
-    cutoff = nth_business_day_of_month(report_year, report_month, BUSINESS_DAY_SLA)
-    window_start = dt.date(report_year, report_month, 1)
-
-    records = []
-    raw_send_date_in_window = []
-
-    for ws in spreadsheet.worksheets():
-        try:
-            values = get_all_values_with_retry(ws)
-        except Exception as e:
-            print(f"SKIPPING worksheet '{ws.title}' after retries failed: {e}")
-            continue
-        if not values:
-            continue
-
-        headers = values[0]
-        col_period = find_col_index(headers, "billing_period")
-        col_hotel = find_col_index(headers, "hotel_name")
-        col_uploaded = find_col_index(headers, "data_uploaded_flag")
-        col_upload_date = find_col_index(headers, "upload_date")
-        col_sent_flag = find_col_index(headers, "results_sent_flag")
-        col_send_date = find_col_index(headers, "send_date")
-        col_status = find_col_index(headers, "status")
-
-        if col_period is None or col_upload_date is None or col_send_date is None:
-            continue
-
-        for row_num, row in enumerate(values[1:], start=2):
-            if len(row) <= max(col_period, col_upload_date, col_send_date):
-                continue
-            parsed_period = parse_billing_period(row[col_period])
-            if not parsed_period:
-                continue
-            month_key, year = parsed_period
-            if month_key != target_billing_period:
-                continue
-
-            hotel_name = row[col_hotel].strip() if (col_hotel is not None and len(row) > col_hotel) else "(no hotel name column)"
-            uploaded_flag = is_truthy(row[col_uploaded]) if col_uploaded is not None else bool(row[col_upload_date])
-            upload_date = parse_date(row[col_upload_date], year)
-            sent_flag = is_truthy(row[col_sent_flag]) if col_sent_flag is not None else bool(row[col_send_date])
-            send_date = parse_date(row[col_send_date], year)
-            status = normalize(row[col_status]) if (col_status is not None and len(row) > col_status) else ""
-
-            eligible = bool(
-                uploaded_flag
-                and upload_date
-                and upload_date <= cutoff
-                and status not in EXCLUDED_STATUSES
-            )
-            sent_in_window = sent_flag and send_date is not None and window_start <= send_date <= cutoff
-            within_sla = sent_in_window
-
-            records.append({
-                "sheet_title": ws.title,
-                "row_num": row_num,
-                "hotel_name": hotel_name,
-                "upload_date_raw": row[col_upload_date] if len(row) > col_upload_date else "",
-                "upload_date_parsed": upload_date.isoformat() if upload_date else None,
-                "uploaded_flag_raw": row[col_uploaded] if (col_uploaded is not None and len(row) > col_uploaded) else "",
-                "status_raw": row[col_status] if (col_status is not None and len(row) > col_status) else "",
-                "send_date_raw": row[col_send_date] if len(row) > col_send_date else "",
-                "send_date_parsed": send_date.isoformat() if send_date else None,
-                "eligible": eligible,
-                "counted_within_sla": within_sla,
-            })
-
-            if send_date is not None and window_start <= send_date <= cutoff:
-                raw_send_date_in_window.append({
-                    "sheet_title": ws.title,
-                    "row_num": row_num,
-                    "hotel_name": hotel_name,
-                    "results_sent_flag_raw": row[col_sent_flag] if (col_sent_flag is not None and len(row) > col_sent_flag) else "",
-                    "send_date_raw": row[col_send_date] if len(row) > col_send_date else "",
-                    "send_date_parsed": send_date.isoformat(),
-                    "would_be_counted": within_sla,
-                })
-
-    return records, window_start, cutoff, raw_send_date_in_window
-
-
-def print_diagnostic_listing(records, window_start, cutoff, raw_send_date_in_window):
-    within_sla_records = [r for r in records if r["counted_within_sla"]]
-    eligible_records = [r for r in records if r["eligible"]]
-    missing_upload_info = [r for r in within_sla_records if not r["eligible"]]
-    rate_pct = round(len(within_sla_records) / len(eligible_records) * 100, 1) if eligible_records else None
-
-    print(f"\nSLA window for this month: {window_start.isoformat()} through {cutoff.isoformat()} "
-          f"(fixed for the whole cohort, not per-row; excludes weekends and US federal holidays).")
-    print(f"{len(records)} total rows matched this billing period across all tabs.")
-    print(f"{len(eligible_records)} eligible files (Data Uploaded + Upload Date, Upload Date "
-          f"within this month's SLA window, Status not Cancelling).")
-    print(f"{len(within_sla_records)} counted as 'within 7 business days' "
-          f"(Results Sent? = true AND Send Date in window - independent of eligibility).")
-    print(f"Rate: {len(within_sla_records)}/{len(eligible_records)} = {rate_pct}%")
-    print(f"{len(raw_send_date_in_window)} rows have ANY Send Date value parsing into this window "
-          f"regardless of the Results Sent? flag.\n")
-
-    print("--- Rows counted as within SLA ---")
-    for r in within_sla_records:
-        flag_note = "" if r["eligible"] else "  [Data Uploaded/Upload Date missing - informational only, does not affect count]"
-        print(f"  [{r['sheet_title']} row {r['row_num']}] {r['hotel_name']}: "
-              f"uploaded {r['upload_date_raw']!r} -> {r['upload_date_parsed']}, "
-              f"sent {r['send_date_raw']!r} -> {r['send_date_parsed']}{flag_note}")
-
-    if missing_upload_info:
-        print(f"\n{len(missing_upload_info)} of the above rows are missing Data Uploaded/Upload "
-              f"Date info - worth a sheet cleanup pass, but not excluded from the count.")
-
-    seen = {}
-    for r in within_sla_records:
-        key = (r["hotel_name"], r["send_date_parsed"])
-        seen.setdefault(key, []).append(r["sheet_title"])
-    dupes = {k: v for k, v in seen.items() if len(v) > 1}
-    if dupes:
-        print("\n--- Possible duplicates (same hotel + send date on multiple tabs) ---")
-        for (hotel, send_date), tabs in dupes.items():
-            print(f"  {hotel} sent {send_date}: appears on tabs {tabs}")
-    else:
-        print("\nNo same-hotel-and-send-date duplicates found across tabs.")
+    return aggs, sent_by_month
 
 
 # ---------------------------------------------------------------------------
@@ -475,21 +412,32 @@ def fetch_existing_month_keys(status_filter=None):
     return {r["month_key"] for r in rows}
 
 
-def upsert_month(month_key, agg, status, dry_run=False):
+def upsert_month(month_key, agg, total_files_sent, status):
+    """Full-row write. Only ever called for a month that is NOT yet
+    SLA-locked (status='current') or the very first time a month
+    transitions to 'closed' - both of those are legitimate moments to
+    write everything at once. Never called again for an already-locked
+    month; see patch_total_files_sent() for what happens to those.
+
+    total_files_sent is passed in explicitly (from
+    total_files_sent_by_send_month()), NOT read off agg - it's grouped
+    by Send Date's calendar month, a different axis than agg's
+    billing-period grouping."""
     rate = (agg.sent_within_sla / agg.eligible_files * 100) if agg.eligible_files else None
     payload = {
         "month_key": month_key,
         "eligible_files": agg.eligible_files,
         "sent_within_7bd": agg.sent_within_sla,
         "rate_pct": round(rate, 1) if rate is not None else None,
-        "total_files_sent": agg.total_files_sent,
+        "total_files_sent": total_files_sent,
         "status": status,
-        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "updated_at": dt.datetime.utcnow().isoformat(),
     }
-    if dry_run:
-        print(f"[DRY RUN] Would upsert {month_key} ({status}): {payload}")
-        return
-    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
+    # on_conflict=month_key: month_key is confirmed to be the table's
+    # actual primary key (checked directly via pg_get_constraintdef), so
+    # this is just making that explicit rather than fixing a real bug -
+    # an earlier duplicate-row theory here was investigated and ruled out.
+    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?on_conflict=month_key"
     resp = requests.post(
         url,
         headers={**supabase_headers(), "Prefer": "resolution=merge-duplicates"},
@@ -498,6 +446,36 @@ def upsert_month(month_key, agg, status, dry_run=False):
     )
     resp.raise_for_status()
     print(f"Upserted {month_key} ({status}): {payload}")
+
+
+def patch_total_files_sent(month_key, total_files_sent):
+    """total_files_sent is a genuinely different metric from the SLA
+    trio (eligible_files/sent_within_7bd/rate_pct), and grouped on a
+    different axis entirely: "how many invoices, from ANY billing
+    period, were sent during THIS calendar month" - not "of the
+    invoices belonging to the billing period this row is built from,
+    how many have been sent to date." It's expected to keep climbing all
+    month as invoices go out, entirely independent of whether some
+    OTHER billing period's SLA determination has locked. Confirmed
+    directly - this is not a bug to fix, it's the intended design.
+
+    Once a month is SLA-locked, this is the ONLY field that should keep
+    updating on its row. A full upsert_month() call here would also
+    recompute and overwrite eligible_files/sent_within_7bd/rate_pct with
+    a fresh value from today's sheet read - which might genuinely differ
+    from what was locked in (e.g. a hotel backdating an upload weeks
+    late) and would silently un-freeze exactly what sla_window_closed()
+    exists to protect. This does a narrow PATCH touching only
+    total_files_sent and updated_at, leaving status and the three SLA
+    columns exactly as they were the moment this month locked."""
+    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?month_key=eq.{month_key}"
+    payload = {
+        "total_files_sent": total_files_sent,
+        "updated_at": dt.datetime.utcnow().isoformat(),
+    }
+    resp = requests.patch(url, headers=supabase_headers(), json=payload, timeout=30)
+    resp.raise_for_status()
+    print(f"Patched total_files_sent for locked month {month_key}: {total_files_sent}")
 
 
 # ---------------------------------------------------------------------------
@@ -515,54 +493,70 @@ def month_key_n_back(n):
     return f"{year:04d}-{month:02d}"
 
 
-def main(force_months=None, dry_run=False):
-    force_months = set(force_months or [])
-    current_billing_period = month_key_n_back(0)
+def shift_month_key(month_key, n):
+    """Shifts a 'YYYY-MM' key forward (or back, if n is negative) by n
+    months. Used to convert a BILLING PERIOD (which tab/period was read
+    from the sheet) into a REPORTING label (which month's throughput this
+    counts toward on the dashboard) - these are deliberately different:
+    July's billing period is processed in August, so July's billing-
+    period data should be labeled and displayed as August's result."""
+    year, month = (int(x) for x in month_key.split("-"))
+    total = year * 12 + (month - 1) + n
+    year, month = divmod(total, 12)
+    return f"{year:04d}-{month + 1:02d}"
+
+
+def main(force_months=None):
+    force_months = set(force_months or [])  # these are REPORTING labels, e.g. '2026-08'
     wanted_billing_periods = [month_key_n_back(n) for n in range(TRAILING_MONTHS + 1)]
+    wanted_report_months = [shift_month_key(bp, 1) for bp in wanted_billing_periods]
 
-    already_closed = fetch_existing_month_keys(status_filter="closed")
+    already_closed = fetch_existing_month_keys(status_filter="closed")  # these are REPORTING labels too
 
-    creds = get_credentials()
-    gc = gspread.authorize(creds)
+    gc = get_gspread_client()
     spreadsheet = gc.open_by_key(SHEET_ID)
 
-    aggs = extract_month_aggregates(spreadsheet, wanted_billing_periods)
+    # Single pass over every worksheet feeding two differently-grouped
+    # results - see extract_all_aggregates()'s docstring for why this
+    # isn't two separate scans (rate-limit risk on 40+ tabs).
+    aggs, sent_by_month = extract_all_aggregates(spreadsheet, wanted_billing_periods, wanted_report_months)
 
     for billing_period in wanted_billing_periods:
         agg = aggs.get(billing_period)
         if agg is None or agg.rows_seen == 0:
-            continue
+            continue  # no data found for this billing period in the sheet yet/anymore
 
+        # The billing period itself is correct as read - only the LABEL
+        # this gets stored/displayed under shifts forward one month.
+        # Processing July's billing period happens in August, so this
+        # data is August's throughput number, not July's.
         report_month_key = shift_month_key(billing_period, 1)
+        total_sent = sent_by_month.get(report_month_key, 0)
 
-        if billing_period == current_billing_period:
-            upsert_month(report_month_key, agg, status="current", dry_run=dry_run)
+        if not sla_window_closed(billing_period):
+            # Window still open for at least some rows in this billing
+            # period - keep recomputing/overwriting daily. Deliberately
+            # NOT tied to current_billing_period/calendar-month rollover
+            # anymore - see sla_window_closed()'s docstring for why.
+            upsert_month(report_month_key, agg, total_sent, status="current")
         elif report_month_key in already_closed and report_month_key not in force_months:
-            continue
+            # SLA-locked: eligible_files/sent_within_7bd/rate_pct/status
+            # must not change again. total_files_sent is a separate,
+            # ongoing metric grouped by calendar month, not billing
+            # period, that keeps updating even after THIS billing
+            # period's SLA lock - see total_files_sent_by_send_month()
+            # and patch_total_files_sent()'s docstrings - so it's the
+            # only thing that gets touched here, via a narrow PATCH
+            # rather than a full upsert.
+            patch_total_files_sent(report_month_key, total_sent)
         else:
-            upsert_month(report_month_key, agg, status="closed", dry_run=dry_run)
+            upsert_month(report_month_key, agg, total_sent, status="closed")
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true",
-                         help="No Supabase writes - just prints what would happen.")
-    parser.add_argument("--month", type=str, action="append", default=None,
-                         help="Force-recompute a specific already-closed REPORTING month "
-                              "(e.g. 2026-08). Repeatable.")
-    parser.add_argument("--list-rows", type=str, default=None,
-                         help="Diagnostic, read-only: list every row matching this BILLING "
-                              "PERIOD (e.g. 2026-07, not the reporting month) across every "
-                              "tab, showing what counted and why. No Supabase calls at all "
-                              "in this mode.")
-    args = parser.parse_args()
-
-    if args.list_rows:
-        creds = get_credentials()
-        gc = gspread.authorize(creds)
-        spreadsheet = gc.open_by_key(SHEET_ID)
-        records, window_start, cutoff, raw_send_date_in_window = list_rows_for_billing_period(spreadsheet, args.list_rows)
-        print_diagnostic_listing(records, window_start, cutoff, raw_send_date_in_window)
-    else:
-        main(force_months=args.month, dry_run=args.dry_run)
+    # Optional: python sync_data_processing_metrics.py 2026-08 2026-07
+    # forces a recompute of specific already-closed months. These are
+    # REPORTING labels (what you see on the dashboard), not billing
+    # periods - e.g. pass '2026-08' to force-recompute August's row,
+    # which is built from July's billing-period tab.
+    main(force_months=sys.argv[1:])
