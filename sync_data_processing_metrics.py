@@ -95,6 +95,22 @@ never called for it again; instead patch_total_files_sent() runs on
 every subsequent execution, touching only total_files_sent and
 updated_at. status, eligible_files, sent_within_7bd, and rate_pct are
 frozen forever at whatever they were the moment the window closed.
+
+--- CORRECTED: total_files_sent's grouping key ---
+A second pass at this fix grouped total_files_sent by the CALENDAR MONTH
+of each row's own Send Date, scanning every billing-period tab in the
+24-month backfill window looking for matching dates - built on the
+assumption that a late invoice might get its Send Date filled in on an
+OLD tab after a newer one already exists. Confirmed directly - that
+never happens on this sheet. Older tabs are frozen the moment a new one
+is created; an invoice that wasn't sent while its tab was current does
+NOT get updated retroactively - the billing period itself simply shifts
+forward for that hotel instead (it becomes a fresh row in the new tab,
+not an update to the old one). So there is no cross-tab "late send" to
+find, and scanning for one only undercounted against what a single-tab
+count would show. total_files_sent is now grouped the SAME way as
+eligible_files/sent_within_sla: by billing period (see
+extract_month_aggregates()), computed in the one worksheet scan.
 """
 
 import os
@@ -350,6 +366,7 @@ def sla_window_closed(billing_period, today=None):
 class MonthAgg:
     eligible_files: int = 0
     sent_within_sla: int = 0
+    total_files_sent: int = 0
     rows_seen: int = 0
 
 
@@ -395,47 +412,34 @@ def relevant_worksheets(spreadsheet, cutoff_month_key):
     return spreadsheet.worksheets()
 
 
-def extract_all_aggregates(spreadsheet, billing_periods_wanted, report_months_wanted):
-    """Single pass over every worksheet, feeding TWO separate results
-    that group rows by two different keys - merged into one scan
-    specifically to avoid a second full read of all 40+ tabs, which is
-    exactly the kind of repeated-full-scan pattern that caused the rate-
-    limit incident get_all_values_with_retry() exists to guard against.
+def extract_month_aggregates(spreadsheet, billing_periods_wanted):
+    """Scans all worksheets once, bucketing rows into MonthAgg by their
+    actual Billing Period Analyzed value (not by tab name) - a single
+    tab occasionally contains rows spanning more than one billing
+    period, though in practice each tab represents one period, and
+    older tabs are never touched again once a new one is created.
+    Returns {billing_period_month_key: MonthAgg}.
 
-    Returns (aggs, sent_by_month):
-      aggs: {billing_period_month_key: MonthAgg} - eligible_files/
-            sent_within_sla, grouped by which billing period a row
-            belongs to (its Billing Period Analyzed cell).
-      sent_by_month: {report_month_key: int} - total_files_sent,
-            grouped by the CALENDAR MONTH of a row's Send Date,
-            regardless of which billing period that row belongs to.
-            Confirmed directly: a July-billing-period invoice sent in
-            August counts toward August's total, not July's - this is a
-            different question from "of the invoices belonging to
-            billing period X, how many hit the 7-day target," so it
-            can't share aggs' grouping key.
+    CORRECTED: total_files_sent is grouped the SAME way as
+    eligible_files/sent_within_sla - by billing period (i.e. whichever
+    tab that period's rows live in) - NOT by the calendar month of each
+    row's own Send Date. An earlier version grouped total_files_sent by
+    Send Date instead, scanning across every tab in the 24-month window
+    looking for matching dates. That was built on a wrong assumption:
+    that an invoice which missed being sent while its tab was current
+    might get its Send Date filled in LATER, on that now-old tab, after
+    a newer tab already exists. Confirmed directly - that never happens.
+    Older tabs are frozen the moment a new one is created; an invoice
+    that wasn't sent in time doesn't get chased down retroactively in
+    its original tab, the billing period itself simply shifts forward
+    for that hotel instead. So there is no cross-tab "late send" to find
+    - scanning every tab for it only under-served the real (single-tab)
+    count and needlessly re-read 40+ tabs' worth of already-frozen data.
 
     Reference year for parsing no-year date values (both Upload Date and
     Send Date) always comes from the row's own Billing Period Analyzed
-    cell - neither date field is assumed to carry a year on its own.
-
-    FIXED: total_files_sent only needs Billing Period + Sent flag + Send
-    Date - it never reads Upload Date at all. An earlier version of this
-    function required ALL of col_period/col_upload_date/col_send_date to
-    even consider a row (a leftover from when the two metrics were
-    separate functions with separate, appropriately-scoped requirements),
-    which silently dropped rows from total_files_sent that were perfectly
-    valid for it but happened to be missing/blank in Upload Date. This
-    combined with get_all_values() omitting TRAILING blank cells - a row
-    whose last populated-looking column trails off blank comes back
-    shorter than the header row - meant a row complete for "was this
-    sent" but blank in a trailing Upload Date column got treated as
-    invalid and skipped entirely, undercounting total_files_sent. See
-    _cell() below: the two metrics now have independent minimum column
-    requirements, and a short row is read as "blank in that column," not
-    "skip this whole row.\""""
+    cell - neither date field is assumed to carry a year on its own."""
     aggs = {mk: MonthAgg() for mk in billing_periods_wanted}
-    sent_by_month = {mk: 0 for mk in report_months_wanted}
 
     def _cell(row, idx):
         """Safe column access. A row can be legitimately shorter than
@@ -463,19 +467,18 @@ def extract_all_aggregates(spreadsheet, billing_periods_wanted, report_months_wa
         col_sent_flag = find_col_index(headers, "results_sent_flag")
         col_send_date = find_col_index(headers, "send_date")
 
-        # A tab needs a Billing Period column to contribute to EITHER
-        # metric - everything is grouped off of it, one way or another.
-        # Reference tabs (contact directories, Go Live Fees, etc.) that
-        # lack it entirely are skipped here.
+        # A tab needs a Billing Period column to contribute anything -
+        # everything is grouped off of it. Reference tabs (contact
+        # directories, Go Live Fees, etc.) that lack it entirely are
+        # skipped here.
         if col_period is None:
             continue
-        # Beyond that, the two metrics have INDEPENDENT minimum
-        # requirements - a tab missing Upload Date can still contribute
-        # to total_files_sent (which never reads it), and a tab missing
-        # Send Date can still contribute eligible_files (though not
-        # sent_within_sla). Only skip entirely if neither metric has
-        # what it needs.
-        if col_upload_date is None and col_send_date is None:
+        # Beyond that, eligible_files/sent_within_sla and
+        # total_files_sent have INDEPENDENT minimum requirements: a tab
+        # missing Upload Date can still contribute a Results-Sent count,
+        # and a tab missing a Sent flag/Send Date can still contribute
+        # eligible_files. Only skip entirely if nothing usable is present.
+        if col_upload_date is None and col_sent_flag is None and col_send_date is None:
             continue
 
         for row in values[1:]:
@@ -485,30 +488,28 @@ def extract_all_aggregates(spreadsheet, billing_periods_wanted, report_months_wa
             if not parsed_period:
                 continue
             billing_month_key, year = parsed_period
+            if billing_month_key not in aggs:
+                continue
+
+            agg = aggs[billing_month_key]
+            agg.rows_seen += 1
 
             uploaded_flag = is_truthy(_cell(row, col_uploaded)) if col_uploaded is not None else bool(_cell(row, col_upload_date))
             upload_date = parse_date(_cell(row, col_upload_date), year)
             sent_flag = is_truthy(_cell(row, col_sent_flag)) if col_sent_flag is not None else bool(_cell(row, col_send_date))
             send_date = parse_date(_cell(row, col_send_date), year)
 
-            # --- eligible_files / sent_within_sla: grouped by BILLING PERIOD ---
-            if billing_month_key in aggs:
-                agg = aggs[billing_month_key]
-                agg.rows_seen += 1
-                if uploaded_flag and upload_date:
-                    agg.eligible_files += 1
-                    if sent_flag and send_date:
-                        elapsed = business_days_elapsed(upload_date, send_date)
-                        if elapsed is not None and elapsed <= BUSINESS_DAY_SLA:
-                            agg.sent_within_sla += 1
+            if uploaded_flag and upload_date:
+                agg.eligible_files += 1
+                if sent_flag and send_date:
+                    elapsed = business_days_elapsed(upload_date, send_date)
+                    if elapsed is not None and elapsed <= BUSINESS_DAY_SLA:
+                        agg.sent_within_sla += 1
 
-            # --- total_files_sent: grouped by SEND DATE's calendar month ---
-            if sent_flag and send_date is not None:
-                send_month_key = f"{send_date.year:04d}-{send_date.month:02d}"
-                if send_month_key in sent_by_month:
-                    sent_by_month[send_month_key] += 1
+            if sent_flag:
+                agg.total_files_sent += 1
 
-    return aggs, sent_by_month
+    return aggs
 
 
 # ---------------------------------------------------------------------------
@@ -541,10 +542,10 @@ def upsert_month(month_key, agg, total_files_sent, status, dry_run=False):
     write everything at once. Never called again for an already-locked
     month; see patch_total_files_sent() for what happens to those.
 
-    total_files_sent is passed in explicitly (from
-    total_files_sent_by_send_month()), NOT read off agg - it's grouped
-    by Send Date's calendar month, a different axis than agg's
-    billing-period grouping.
+    total_files_sent is passed in explicitly as its own parameter (even
+    though callers currently always pass agg.total_files_sent) so this
+    function's signature doesn't quietly assume where that number came
+    from.
 
     dry_run=True prints the payload that WOULD be written and returns
     without making any Supabase call at all."""
@@ -578,14 +579,12 @@ def upsert_month(month_key, agg, total_files_sent, status, dry_run=False):
 
 def patch_total_files_sent(month_key, total_files_sent, dry_run=False):
     """total_files_sent is a genuinely different metric from the SLA
-    trio (eligible_files/sent_within_7bd/rate_pct), and grouped on a
-    different axis entirely: "how many invoices, from ANY billing
-    period, were sent during THIS calendar month" - not "of the
-    invoices belonging to the billing period this row is built from,
-    how many have been sent to date." It's expected to keep climbing all
-    month as invoices go out, entirely independent of whether some
-    OTHER billing period's SLA determination has locked. Confirmed
-    directly - this is not a bug to fix, it's the intended design.
+    trio (eligible_files/sent_within_7bd/rate_pct): "how many invoices in
+    THIS billing period's tab have Results Sent = Yes, right now" - a
+    running count that keeps climbing as long as that tab is still being
+    worked, independent of whether the SLA determination for the same
+    period has already locked. Confirmed directly - this is not a bug to
+    fix, it's the intended design.
 
     Once a month is SLA-locked, this is the ONLY field that should keep
     updating on its row. A full upsert_month() call here would also
@@ -675,15 +674,71 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
             eligible = bool(uploaded_flag and upload_date is not None)
             met_sla = bool(eligible and sent_flag and send_date is not None
                            and elapsed is not None and elapsed <= BUSINESS_DAY_SLA)
-            send_month = f"{send_date.year:04d}-{send_date.month:02d}" if send_date else None
 
             print(
                 f"[{ws.title}] {hotel} | uploaded={uploaded_flag} upload_date={upload_date} | "
-                f"sent={sent_flag} send_date={send_date} send_month={send_month} | "
-                f"elapsed_business_days={elapsed} | eligible={eligible} met_sla={met_sla}"
+                f"sent={sent_flag} send_date={send_date} | "
+                f"elapsed_business_days={elapsed} | eligible={eligible} met_sla={met_sla} "
+                f"| contributes_to_total_files_sent={sent_flag}"
             )
 
     print(f"\n{found} row(s) found for billing period {billing_period}.")
+
+
+def audit_columns(spreadsheet):
+    """Diagnostic ONLY - no Supabase calls. For every worksheet, prints
+    which of the four columns this script depends on (billing_period,
+    upload_date, results_sent_flag, send_date) were actually recognized
+    via COLUMN_ALIASES, and - for any tab missing one - the tab's raw
+    header row.
+
+    A tab whose Send Date or Results Sent column uses a header variant
+    NOT in COLUMN_ALIASES silently contributes ZERO rows to
+    total_files_sent (and to eligible_files/sent_within_sla too, if it's
+    Upload Date or Billing Period that's unrecognized) - with no error,
+    no warning, nothing. This is the single most likely explanation for
+    a live count coming in lower than a manually-verified true count:
+    the sheet's own column names have drifted across tabs over the
+    years (see the module docstring), and COLUMN_ALIASES has to be
+    updated by hand whenever that happens. Run this whenever a count
+    looks short and check every "MISSING" line's raw headers against
+    COLUMN_ALIASES to find the drifted name, then add it there."""
+    total_missing_tabs = 0
+    for ws in spreadsheet.worksheets():
+        try:
+            values = get_all_values_with_retry(ws)
+        except Exception as e:
+            print(f"[{ws.title}] SKIPPED after retries failed: {e}")
+            continue
+        if not values:
+            print(f"[{ws.title}] EMPTY tab (no header row)")
+            continue
+
+        headers = values[0]
+        row_count = len(values) - 1
+        col_period = find_col_index(headers, "billing_period")
+        col_upload_date = find_col_index(headers, "upload_date")
+        col_sent_flag = find_col_index(headers, "results_sent_flag")
+        col_send_date = find_col_index(headers, "send_date")
+
+        missing = []
+        if col_period is None:
+            missing.append("billing_period")
+        if col_upload_date is None:
+            missing.append("upload_date")
+        if col_sent_flag is None:
+            missing.append("results_sent_flag")
+        if col_send_date is None:
+            missing.append("send_date")
+
+        if not missing:
+            print(f"[{ws.title}] OK - all 4 columns recognized ({row_count} data rows)")
+        else:
+            total_missing_tabs += 1
+            print(f"[{ws.title}] MISSING {missing} ({row_count} data rows)")
+            print(f"    raw headers: {headers}")
+
+    print(f"\n{total_missing_tabs} tab(s) missing at least one recognized column.")
 
 
 # ---------------------------------------------------------------------------
@@ -714,7 +769,13 @@ def shift_month_key(month_key, n):
     return f"{year:04d}-{month + 1:02d}"
 
 
-def main(force_months=None, dry_run=False, list_rows_billing_period=None):
+def main(force_months=None, dry_run=False, list_rows_billing_period=None, audit=False):
+    if audit:
+        gc = get_gspread_client()
+        spreadsheet = gc.open_by_key(SHEET_ID)
+        audit_columns(spreadsheet)
+        return
+
     if list_rows_billing_period:
         # Diagnostic mode overrides everything else - read-only, no
         # Supabase calls, exits after printing. Matches the workflow's
@@ -726,17 +787,13 @@ def main(force_months=None, dry_run=False, list_rows_billing_period=None):
 
     force_months = set(force_months or [])  # these are REPORTING labels, e.g. '2026-08'
     wanted_billing_periods = [month_key_n_back(n) for n in range(TRAILING_MONTHS + 1)]
-    wanted_report_months = [shift_month_key(bp, 1) for bp in wanted_billing_periods]
 
     already_closed = fetch_existing_month_keys(status_filter="closed")  # these are REPORTING labels too
 
     gc = get_gspread_client()
     spreadsheet = gc.open_by_key(SHEET_ID)
 
-    # Single pass over every worksheet feeding two differently-grouped
-    # results - see extract_all_aggregates()'s docstring for why this
-    # isn't two separate scans (rate-limit risk on 40+ tabs).
-    aggs, sent_by_month = extract_all_aggregates(spreadsheet, wanted_billing_periods, wanted_report_months)
+    aggs = extract_month_aggregates(spreadsheet, wanted_billing_periods)
 
     for billing_period in wanted_billing_periods:
         agg = aggs.get(billing_period)
@@ -748,26 +805,23 @@ def main(force_months=None, dry_run=False, list_rows_billing_period=None):
         # Processing July's billing period happens in August, so this
         # data is August's throughput number, not July's.
         report_month_key = shift_month_key(billing_period, 1)
-        total_sent = sent_by_month.get(report_month_key, 0)
 
         if not sla_window_closed(billing_period):
             # Window still open for at least some rows in this billing
             # period - keep recomputing/overwriting daily. Deliberately
             # NOT tied to current_billing_period/calendar-month rollover
             # anymore - see sla_window_closed()'s docstring for why.
-            upsert_month(report_month_key, agg, total_sent, status="current", dry_run=dry_run)
+            upsert_month(report_month_key, agg, agg.total_files_sent, status="current", dry_run=dry_run)
         elif report_month_key in already_closed and report_month_key not in force_months:
             # SLA-locked: eligible_files/sent_within_7bd/rate_pct/status
-            # must not change again. total_files_sent is a separate,
-            # ongoing metric grouped by calendar month, not billing
-            # period, that keeps updating even after THIS billing
-            # period's SLA lock - see total_files_sent_by_send_month()
-            # and patch_total_files_sent()'s docstrings - so it's the
-            # only thing that gets touched here, via a narrow PATCH
-            # rather than a full upsert.
-            patch_total_files_sent(report_month_key, total_sent, dry_run=dry_run)
+            # must not change again. total_files_sent is still refreshed
+            # on every run - the tab itself is frozen once superseded, so
+            # this naturally stabilizes rather than needing a special
+            # cutoff - via a narrow PATCH rather than a full upsert, so
+            # the frozen SLA fields are never touched again.
+            patch_total_files_sent(report_month_key, agg.total_files_sent, dry_run=dry_run)
         else:
-            upsert_month(report_month_key, agg, total_sent, status="closed", dry_run=dry_run)
+            upsert_month(report_month_key, agg, agg.total_files_sent, status="closed", dry_run=dry_run)
 
 
 if __name__ == "__main__":
@@ -786,6 +840,11 @@ if __name__ == "__main__":
                          help="Diagnostic only: print every row found for this BILLING PERIOD "
                               "(e.g. 2026-07 for August's reporting month), then exit. Read-only - "
                               "makes no Supabase calls. Overrides --dry-run/--month when set.")
+    parser.add_argument("--audit-columns", action="store_true",
+                         help="Diagnostic only: for every worksheet, print which required columns "
+                              "were recognized and the raw header row for any tab missing one, then "
+                              "exit. Read-only - makes no Supabase calls. Run this when a count looks "
+                              "short - a drifted column header on some tab is the most likely cause.")
     args = parser.parse_args()
 
     all_force_months = list(args.force_months) + list(args.positional_months)
@@ -793,4 +852,5 @@ if __name__ == "__main__":
         force_months=all_force_months,
         dry_run=args.dry_run,
         list_rows_billing_period=args.list_rows_billing_period,
+        audit=args.audit_columns,
     )
