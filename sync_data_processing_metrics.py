@@ -9,16 +9,15 @@ dashboard can read them instead of relying on manual entry.
 Run daily via GitHub Actions (see data-processing-sync.yml).
 
 --- Design notes / assumptions (confirm these match reality before trusting numbers) ---
-1. FIXED WINDOW (confirmed with Pia 2026-09-22, replaces the earlier
-   per-file "7 business days from each file's own Upload Date" clock).
-   The deadline for a billing period is business day 7 of its
-   PROCESSING month (see processing_deadline()). "Eligible files" = rows
-   where Data Uploaded is Yes/TRUE AND the Upload Date is on or before
-   that deadline - a file that arrived after it couldn't have been
-   processed in the window, so it isn't held to it.
+1. "Eligible files" (confirmed with Pia 2026-09-22) = rows where Data
+   Uploaded is Yes/TRUE AND the Upload Date is on or before the
+   eligibility cutoff: business day 7 of the PROCESSING month (see
+   processing_deadline()). A file that wasn't there by then can't be
+   held to the metric.
 2. "Sent within 7 business days" (sent_within_7bd) = eligible rows where
-   Results Sent is Yes AND the Send Date is on or before the same
-   deadline. See evaluate_row_sla() - the single shared definition. Business days = Mon-Fri, EXCLUDING the 11 standard
+   Results Sent is Yes AND the Send Date is no more than 7 business days
+   after THAT file's own Upload Date - unchanged per-file clock. See
+   evaluate_row_sla(), the single shared definition. Business days = Mon-Fri, EXCLUDING the 11 standard
    US federal holidays (observed dates) AND Curacity's own closures (day
    after Thanksgiving, weekday Christmas Eve) - see federal_holidays(),
    curacity_closures() and business_days_elapsed(). The holiday list is computed in-code, not
@@ -469,43 +468,58 @@ def processing_deadline(billing_period):
     return nth_business_day(year, month, BUSINESS_DAY_SLA)
 
 
+def add_business_days(start_date, n):
+    """start_date shifted forward by n business days (same holiday and
+    closure calendar as business_days_elapsed())."""
+    current = start_date
+    added = 0
+    while added < n:
+        current += dt.timedelta(days=1)
+        if current.weekday() < 5 and current not in (federal_holidays(current.year) | curacity_closures(current.year)):
+            added += 1
+    return current
+
+
 def evaluate_row_sla(billing_period, uploaded_flag, upload_date, sent_flag, send_date):
     """The ONE place eligibility and SLA outcome are decided, shared by
     the real sync and --list-rows so they can never disagree.
 
-    Fixed-window definition, confirmed with Pia 2026-09-22 (replaces the
-    earlier per-file '7 business days from each file's own Upload Date'
-    clock):
+    Confirmed with Pia 2026-09-22 - ONLY eligibility changed; the
+    on-time test is the same per-file clock as always:
       eligible = Data Uploaded = Yes AND Upload Date on or before the
-                 deadline (business day 7 of the processing month). A
-                 file that arrives after the deadline couldn't have been
-                 processed in the window, so it isn't held to it - it
-                 still counts toward total_files_sent once sent.
-      met      = eligible AND Results Sent = Yes AND Send Date on or
-                 before the same deadline.
-    Returns (eligible, met, deadline)."""
-    deadline = processing_deadline(billing_period)
-    eligible = bool(uploaded_flag and upload_date is not None and upload_date <= deadline)
-    met = bool(eligible and sent_flag and send_date is not None and send_date <= deadline)
-    return eligible, met, deadline
+                 eligibility cutoff (business day 7 of the processing
+                 month - see processing_deadline()). A file that wasn't
+                 there by then can't be held to the metric. It still
+                 counts toward total_files_sent once sent.
+      met      = eligible AND Results Sent = Yes AND Send Date no more
+                 than BUSINESS_DAY_SLA business days after THAT file's
+                 own Upload Date (holiday/closure-aware).
+    So met under this rule = met under the old rule, minus only files
+    uploaded after the cutoff (they leave numerator AND denominator).
+    Returns (eligible, met, cutoff, elapsed_business_days)."""
+    cutoff = processing_deadline(billing_period)
+    eligible = bool(uploaded_flag and upload_date is not None and upload_date <= cutoff)
+    elapsed = business_days_elapsed(upload_date, send_date) if (upload_date and send_date) else None
+    met = bool(eligible and sent_flag and elapsed is not None and elapsed <= BUSINESS_DAY_SLA)
+    return eligible, met, cutoff, elapsed
 
 
 def sla_window_closed(billing_period, today=None):
-    """True once the SLA window has definitively closed for EVERY row in
-    this billing period: i.e. the day after processing_deadline()
-    (business day 7 of the processing month). After that no row's
-    eligible/met outcome can change by waiting - anything uploaded later
-    is ineligible, and anything sent later missed the deadline.
-    (Updated 2026-09-22 for the fixed-window definition; previously this
-    was 'period end + 7 business days', which for a full-month billing
-    period lands on the same date.)"""
+    """True once no eligible row in this billing period can still change
+    outcome: the day after (eligibility cutoff + BUSINESS_DAY_SLA
+    business days). For July 2026's billing period: cutoff Tue 8/11,
+    last on-time send Thu 8/20, locks Fri 8/21. (Updated 2026-09-22 -
+    previously period end + 7 business days, which was too early once
+    files uploaded during the processing month's first week became
+    eligible with their own 7-day clocks still running.)"""
     if today is None:
         today = dt.date.today()
-    # Fixed window: every row's outcome is settled once the deadline
-    # (business day 7 of the processing month) has fully passed. Locks
-    # the day AFTER the deadline, so sends logged on the deadline day
-    # itself are still captured before freezing.
-    return today > processing_deadline(billing_period)
+    # The latest ELIGIBLE upload is on the cutoff (business day 7 of the
+    # processing month); its own 7-business-day clock ends 7 business
+    # days after that. Lock the day after, so a send on that last day is
+    # still captured. Before then some eligible row could still pass.
+    last_possible_on_time_send = add_business_days(processing_deadline(billing_period), BUSINESS_DAY_SLA)
+    return today > last_possible_on_time_send
 
 
 @dataclass
@@ -651,7 +665,7 @@ def extract_month_aggregates(spreadsheet, billing_periods_wanted):
             sent_flag = is_truthy(_cell(row, col_sent_flag)) if col_sent_flag is not None else bool(_cell(row, col_send_date))
             send_date = parse_date(_cell(row, col_send_date), year, ref_month)
 
-            eligible, met, _deadline = evaluate_row_sla(
+            eligible, met, _cutoff, _elapsed = evaluate_row_sla(
                 billing_month_key, uploaded_flag, upload_date, sent_flag, send_date
             )
             if eligible:
@@ -785,6 +799,13 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
 
     found = 0
     inferred_total = 0
+    # Breakdown of every ELIGIBLE row that did NOT meet the deadline, by
+    # reason - so a low rate_pct can be traced to specific rows instead
+    # of guessed at. Keys are reason labels, values are [hotel, ...].
+    miss_reasons = {}
+    removed_by_cutoff = []  # on time per-file, but uploaded after the cutoff
+    eligible_by_upload_timing = {"before processing month": [0, 0],   # [eligible, met]
+                                 "during window (BD1-BD7)": [0, 0]}
     unparsed_by_tab = {}            # tab title -> [(hotel, raw period)]
     unrecognized_sent_values = {}   # raw Results Sent value -> row count
 
@@ -839,14 +860,42 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
             if raw_sent.strip() and not sent_flag and normalize(raw_sent) not in {"no", "n", "false"}:
                 unrecognized_sent_values[raw_sent.strip()] = unrecognized_sent_values.get(raw_sent.strip(), 0) + 1
 
-            eligible, met_sla, deadline = evaluate_row_sla(
+            eligible, met_sla, deadline, elapsed = evaluate_row_sla(
                 parsed_period[0], uploaded_flag, upload_date, sent_flag, send_date
             )
+
+            if (not eligible and uploaded_flag and upload_date is not None and sent_flag
+                    and elapsed is not None and elapsed <= BUSINESS_DAY_SLA):
+                removed_by_cutoff.append(f"{hotel} (upload {upload_date}, send {send_date})")
+
+            if eligible:
+                proc_start = dt.date(deadline.year, deadline.month, 1)
+                timing = ("before processing month" if upload_date < proc_start
+                          else "during window (BD1-BD7)")
+                eligible_by_upload_timing[timing][0] += 1
+                if met_sla:
+                    eligible_by_upload_timing[timing][1] += 1
+                else:
+                    raw_send = _cell(row, col_send_date).strip()
+                    if not sent_flag and not raw_send:
+                        reason = "not sent yet (flag not Yes, no Send Date)"
+                    elif not sent_flag:
+                        reason = "Send Date filled but Results Sent flag not Yes"
+                    elif send_date is None and raw_send:
+                        reason = "sent, but Send Date unparseable"
+                    elif send_date is None:
+                        reason = "sent, but Send Date blank"
+                    else:
+                        reason = f"sent more than {BUSINESS_DAY_SLA} business days after upload"
+                    label = (f"{hotel} (upload {upload_date}, send {send_date or repr(raw_send)}, "
+                             f"elapsed {elapsed})")
+                    miss_reasons.setdefault(reason, []).append(label)
 
             print(
                 f"[{ws.title}] {hotel} | uploaded={uploaded_flag} upload_date={upload_date} | "
                 f"sent={sent_flag} send_date={send_date} | "
-                f"deadline={deadline} | eligible={eligible} met_sla={met_sla} "
+                f"elapsed_business_days={elapsed} | eligibility_cutoff={deadline} | "
+                f"eligible={eligible} met_sla={met_sla} "
                 f"| contributes_to_total_files_sent={sent_flag}"
                 + (" | period INFERRED from tab title (cell blank)" if inferred else "")
             )
@@ -858,6 +907,27 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
 
     print(f"\n{found} row(s) found for billing period {billing_period} "
           f"({inferred_total} of them via tab-title fallback for a blank period cell).")
+
+    print(f"\nREMOVED BY ELIGIBILITY CUTOFF - {len(removed_by_cutoff)} row(s) uploaded after "
+          f"{processing_deadline(billing_period)} that WERE sent within {BUSINESS_DAY_SLA} business "
+          f"days. These are the ONLY rows the cutoff removes from sent_within_7bd:")
+    for h in removed_by_cutoff:
+        print(f"    {h}")
+
+    print(f"\nELIGIBLE BY UPLOAD TIMING (cutoff {processing_deadline(billing_period)}):")
+    for timing, (n_elig, n_met) in eligible_by_upload_timing.items():
+        pct = f"{n_met / n_elig * 100:.1f}%" if n_elig else "n/a"
+        print(f"  {timing}: {n_met}/{n_elig} met ({pct})")
+
+    if miss_reasons:
+        total_missed = sum(len(v) for v in miss_reasons.values())
+        print(f"\nELIGIBLE BUT MISSED - {total_missed} row(s), by reason:")
+        for reason, hotels in sorted(miss_reasons.items(), key=lambda kv: -len(kv[1])):
+            print(f"  {reason}: {len(hotels)}")
+        for reason, hotels in sorted(miss_reasons.items(), key=lambda kv: -len(kv[1])):
+            print(f"\n  -- {reason} --")
+            for h in hotels:
+                print(f"    {h}")
 
     if unparsed_by_tab:
         total_unparsed = sum(len(v) for v in unparsed_by_tab.values())
