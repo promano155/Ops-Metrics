@@ -907,20 +907,20 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         )
 
        # Before
-is_file_error = data_uploaded_value.lower() == "error"
-is_integration_issue = "integration issue" in next_action_value.lower()
-is_data_issue = (not is_integration_issue) and "data issue" in next_action_value.lower()
-
-if not is_file_error and not is_data_issue and not is_integration_issue:
-    continue  # not flagged - no action, by design
-  # After
-data_uploaded_lower = data_uploaded_value.lower()
-is_file_error = data_uploaded_lower == "error"
-is_integration_issue = data_uploaded_lower == "integration issue"
-is_data_issue = "data issue" in next_action_value.lower()
-
-if not is_file_error and not is_data_issue and not is_integration_issue:
-    continue  # not flagged (includes Delayed Billing - deliberately no Asana trigger)
+        is_file_error = data_uploaded_value.lower() == "error"
+        is_integration_issue = "integration issue" in next_action_value.lower()
+        is_data_issue = (not is_integration_issue) and "data issue" in next_action_value.lower()
+        
+        if not is_file_error and not is_data_issue and not is_integration_issue:
+            continue  # not flagged - no action, by design
+          # After
+        data_uploaded_lower = data_uploaded_value.lower()
+        is_file_error = data_uploaded_lower == "error"
+        is_integration_issue = data_uploaded_lower == "integration issue"
+        is_data_issue = "data issue" in next_action_value.lower()
+        
+        if not is_file_error and not is_data_issue and not is_integration_issue:
+            continue  # not flagged (includes Delayed Billing - deliberately no Asana trigger)
 
         if is_file_error:
             issue_type_option_gid = ISSUE_TYPE_FILE_ERROR_OPTION_GID
