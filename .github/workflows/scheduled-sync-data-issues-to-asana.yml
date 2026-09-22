@@ -1,0 +1,45 @@
+name: scheduled-sync-data-issues-to-asana
+
+# Production workflow - dispatched by cron-job.org (per project convention;
+# GitHub's native scheduler is unreliable) on a recurring cadence, so new
+# Data Issue / File Error / Integration Issue tasks keep getting pushed
+# from whichever month is currently newest, continuously, with no manual
+# step required.
+#
+# Deliberately has NO month or as_of_day inputs - unlike
+# manual-sync-data-issues-to-asana.yml (kept separate specifically for
+# testing against a specific past month), this workflow can only ever
+# target the newest month, auto-detected fresh on every single run. There
+# is no way to accidentally point a real run at the wrong billing period,
+# because the option to do so doesn't exist here at all.
+#
+# Still points at the TEST Asana project and _test Supabase tables, per
+# the script's own config comments - swap those constants in
+# sync_data_issues_to_asana.py once fully validated and ready to go live
+# for real, at which point this workflow needs no changes itself.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install gspread requests google-auth
+
+      - name: Run sync (newest month, real writes)
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          ASANA_PAT: ${{ secrets.ASANA_PAT }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python sync_data_issues_to_asana.py
