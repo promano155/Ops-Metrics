@@ -508,7 +508,7 @@ def fetch_closed_months():
 
 
 def upsert_row(month_key, scope, tickets_closed, eligible_closed, within_sla,
-               within_sla_adjusted, status):
+               within_sla_adjusted, status, dry_run=False):
     # Both percentages are out of eligible_closed (tickets that actually
     # had an SLA target), not tickets_closed - see owner_month_stats().
     sla_pct = round(within_sla / eligible_closed * 100, 1) if eligible_closed else None
@@ -525,6 +525,9 @@ def upsert_row(month_key, scope, tickets_closed, eligible_closed, within_sla,
         "status": status,
         "updated_at": dt.datetime.utcnow().isoformat(),
     }
+    if dry_run:
+        print(f"[DRY RUN] Would upsert {month_key} / {scope} ({status}): {payload}")
+        return
     url = f"{SUPABASE_URL}/rest/v1/{TABLE}"
     resp = requests.post(
         url,
@@ -569,32 +572,39 @@ def main(force_months=None, dry_run=False):
 
         for owner_id, owner_name in OWNERS.items():
             closed, eligible, within, within_adjusted = owner_month_stats(owner_id, month_key)
-            upsert_row(month_key, owner_name, closed, eligible, within, within_adjusted, status)
+            upsert_row(month_key, owner_name, closed, eligible, within, within_adjusted, status,
+                       dry_run=dry_run)
             team_closed += closed
             team_eligible += eligible
             team_within += within
             team_within_adjusted += within_adjusted
 
         upsert_row(month_key, "team", team_closed, team_eligible, team_within,
-                   team_within_adjusted, status)
+                   team_within_adjusted, status, dry_run=dry_run)
 
     # Live "currently open" snapshot for the new Tickets Still Open panel -
     # its own table, no month_key, always overwritten. See
     # sync_open_snapshots()'s docstring and the ASSUMPTIONS note above
-    # OPEN_BUCKETS_TABLE. Only this step honors --dry-run; the monthly
-    # backfill above always writes, matching this script's existing
-    # (pre-this-change) behavior so as not to change production semantics
-    # for a step that wasn't part of this request.
+    # OPEN_BUCKETS_TABLE. --dry-run now covers BOTH steps: the monthly
+    # backfill above (upsert_row) and this snapshot. Previously only the
+    # snapshot honored it, so a "dry run" from manual-ticket-sla-sync.yml
+    # still wrote real monthly rows. Scheduled runs pass no flag, so
+    # production behavior is unchanged.
     sync_open_snapshots(dry_run=dry_run)
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("months", nargs="*",
-                         help="Force-recompute specific already-closed months, e.g. 2026-08 2026-07.")
+    parser.add_argument("months", nargs="*", default=[],
+                         help="Backward-compatible bare month args, e.g. 2026-08 2026-07 - "
+                              "treated identically to repeated --month flags.")
+    parser.add_argument("--month", action="append", dest="force_months", default=[],
+                         help="Force-recompute this already-closed month (e.g. 2026-08). "
+                              "Repeatable. This is the form manual-ticket-sla-sync.yml passes.")
     parser.add_argument("--dry-run", action="store_true",
-                         help="Print what the open-ticket snapshot would write, without writing it. "
-                              "Only affects the open-ticket snapshot step.")
+                         help="Print every monthly row and open-ticket snapshot that would be "
+                              "written, without writing anything. HubSpot and Supabase reads "
+                              "still happen normally.")
     args = parser.parse_args()
-    main(force_months=args.months, dry_run=args.dry_run)
+    main(force_months=list(args.force_months) + list(args.months), dry_run=args.dry_run)
