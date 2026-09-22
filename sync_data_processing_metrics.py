@@ -636,6 +636,8 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
 
     hotel_aliases = ["Hotel Name", "Hotel"]
     found = 0
+    unparsed_by_tab = {}            # tab title -> [(hotel, raw period)]
+    unrecognized_sent_values = {}   # raw Results Sent value -> row count
 
     for ws in spreadsheet.worksheets():
         try:
@@ -662,14 +664,23 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
                 col_hotel = normalized_headers.index(normalize(alias))
                 break
 
+        tab_matches = 0
+        unparsed_rows = []  # (hotel, raw period cell) - rows the real sync silently drops
+
         for row in values[1:]:
             if len(row) <= col_period:
                 continue
             parsed_period = parse_billing_period(row[col_period])
-            if not parsed_period or parsed_period[0] != billing_period:
+            if not parsed_period:
+                hotel_raw = _cell(row, col_hotel).strip()
+                if hotel_raw:
+                    unparsed_rows.append((hotel_raw, row[col_period]))
+                continue
+            if parsed_period[0] != billing_period:
                 continue
 
             found += 1
+            tab_matches += 1
             year = parsed_period[1]
             hotel = _cell(row, col_hotel) or "(no hotel name column found)"
 
@@ -677,6 +688,10 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
             upload_date = parse_date(_cell(row, col_upload_date), year)
             sent_flag = is_truthy(_cell(row, col_sent_flag)) if col_sent_flag is not None else bool(_cell(row, col_send_date))
             send_date = parse_date(_cell(row, col_send_date), year)
+
+            raw_sent = _cell(row, col_sent_flag) if col_sent_flag is not None else ""
+            if raw_sent.strip() and not sent_flag and normalize(raw_sent) not in {"no", "n", "false"}:
+                unrecognized_sent_values[raw_sent.strip()] = unrecognized_sent_values.get(raw_sent.strip(), 0) + 1
 
             elapsed = business_days_elapsed(upload_date, send_date) if (upload_date and send_date) else None
             eligible = bool(uploaded_flag and upload_date is not None)
@@ -690,7 +705,31 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
                 f"| contributes_to_total_files_sent={sent_flag}"
             )
 
+        # Only report unparseable rows for tabs that actually hold this
+        # billing period - otherwise every old tab's junk would drown it out.
+        if tab_matches and unparsed_rows:
+            unparsed_by_tab[ws.title] = unparsed_rows
+
     print(f"\n{found} row(s) found for billing period {billing_period}.")
+
+    if unparsed_by_tab:
+        total_unparsed = sum(len(v) for v in unparsed_by_tab.values())
+        print(f"\nUNPARSEABLE BILLING PERIOD - {total_unparsed} row(s) with a hotel name, on tabs "
+              f"that hold {billing_period}, whose Billing Period Analyzed cell didn't parse. The "
+              f"real sync silently drops these from every count:")
+        for title, rows in unparsed_by_tab.items():
+            for hotel, raw in rows:
+                print(f"  [{title}] {hotel} | raw period cell: {raw!r}")
+    else:
+        print("\nNo unparseable Billing Period Analyzed cells on the matching tab(s).")
+
+    if unrecognized_sent_values:
+        print(f"\nUNRECOGNIZED RESULTS-SENT VALUES - non-blank, not yes/true/y and not no/n/false, "
+              f"so NOT counted in total_files_sent:")
+        for raw, n in sorted(unrecognized_sent_values.items(), key=lambda kv: -kv[1]):
+            print(f"  {raw!r}: {n} row(s)")
+    else:
+        print("No unrecognized Results Sent values among matching rows.")
 
 
 def audit_columns(spreadsheet):
