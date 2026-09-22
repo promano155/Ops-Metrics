@@ -218,13 +218,21 @@ def parse_date(value, reference_year):
 
 
 def parse_billing_period(value):
-    """'6.1.26 - 6.30.26' -> (month_key='2026-06', year=2026)."""
+    """'6.1.26 - 6.30.26' -> (month_key='2026-06', year=2026).
+
+    Buckets by the SECOND date in the cell (the end of a '{start} - {end}'
+    range), positionally - same rule as sync_yellow_rows_to_asana.py's
+    parse_billing_period(). A multi-month range like '6.1.26 - 7.31.26'
+    belongs to July, not June. This previously used re.search(), which
+    only ever returned the FIRST date, so every multi-month row was
+    bucketed into its start month and dropped from its real month's
+    counts. Falls back to the only date present if there's just one."""
     if not value:
         return None
-    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", value)
-    if not m:
+    matches = re.findall(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", value)
+    if not matches:
         return None
-    month, _day, year = m.groups()
+    month, _day, year = matches[1] if len(matches) >= 2 else matches[0]
     year = int(year)
     if year < 100:
         year += 2000
