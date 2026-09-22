@@ -188,6 +188,17 @@ def find_col_index(headers, alias_key):
     return None
 
 
+HOTEL_NAME_ALIASES = ["Hotel Name", "Hotel"]
+
+
+def find_hotel_col_index(headers):
+    normalized_headers = [normalize(h) for h in headers]
+    for alias in HOTEL_NAME_ALIASES:
+        if normalize(alias) in normalized_headers:
+            return normalized_headers.index(normalize(alias))
+    return None
+
+
 def is_truthy(value):
     return normalize(value) in TRUE_VALUES
 
@@ -238,6 +249,50 @@ def parse_billing_period(value):
         year += 2000
     month = int(month)
     return f"{year:04d}-{month:02d}", year
+
+
+_TAB_TITLE_MONTH_RE = re.compile(
+    r"^\s*(january|february|march|april|may|june|july|august|september|"
+    r"october|november|december)\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+
+
+def billing_period_from_tab_title(title):
+    """'July 2026 - Media Brands' / 'July 2026' -> ('2026-07', 2026).
+    Returns None for anything that doesn't START with a full month name
+    and a 4-digit year - deliberately strict, so reference tabs and odd
+    legacy names never match."""
+    m = _TAB_TITLE_MONTH_RE.match(title or "")
+    if not m:
+        return None
+    month = list(calendar.month_name).index(m.group(1).capitalize())
+    year = int(m.group(2))
+    return f"{year:04d}-{month:02d}", year
+
+
+def resolve_billing_period(raw_period, hotel_name, tab_title):
+    """Returns (parsed_period, inferred) for one row.
+
+    Normal path: parse the row's own Billing Period Analyzed cell.
+    Fallback: ONLY when that cell is completely BLANK and the row has a
+    hotel name, use the tab title's month. Confirmed real case: 8 hotels
+    on 'July 2026 - Media Brands' with a blank period cell were being
+    silently dropped from every count. A cell that's filled in but
+    unparseable is NOT inferred - that's a data error to fix, not guess
+    around. Temporary by design: this pipeline moves to the new billing
+    sheet, which has no free-text period column, after launch.
+
+    inferred=True lets callers log every row that used the fallback, so
+    it stays auditable rather than silent."""
+    parsed = parse_billing_period(raw_period)
+    if parsed:
+        return parsed, False
+    if (raw_period or "").strip() == "" and (hotel_name or "").strip():
+        from_title = billing_period_from_tab_title(tab_title)
+        if from_title:
+            return from_title, True
+    return None, False
 
 
 def _nth_weekday_of_month(year, month, weekday, n):
@@ -489,12 +544,17 @@ def extract_month_aggregates(spreadsheet, billing_periods_wanted):
         if col_upload_date is None and col_sent_flag is None and col_send_date is None:
             continue
 
+        col_hotel = find_hotel_col_index(headers)
+        inferred_count = 0
+
         for row in values[1:]:
-            if len(row) <= col_period:
-                continue
-            parsed_period = parse_billing_period(row[col_period])
+            parsed_period, inferred = resolve_billing_period(
+                _cell(row, col_period), _cell(row, col_hotel), ws.title
+            )
             if not parsed_period:
                 continue
+            if inferred:
+                inferred_count += 1
             billing_month_key, year = parsed_period
             if billing_month_key not in aggs:
                 continue
@@ -516,6 +576,10 @@ def extract_month_aggregates(spreadsheet, billing_periods_wanted):
 
             if sent_flag:
                 agg.total_files_sent += 1
+
+        if inferred_count:
+            print(f"[{ws.title}] {inferred_count} row(s) had a BLANK Billing Period Analyzed cell - "
+                  f"used the tab title's month instead (see resolve_billing_period).")
 
     return aggs
 
@@ -634,8 +698,8 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
             return ""
         return row[idx]
 
-    hotel_aliases = ["Hotel Name", "Hotel"]
     found = 0
+    inferred_total = 0
     unparsed_by_tab = {}            # tab title -> [(hotel, raw period)]
     unrecognized_sent_values = {}   # raw Results Sent value -> row count
 
@@ -657,30 +721,26 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
         col_sent_flag = find_col_index(headers, "results_sent_flag")
         col_send_date = find_col_index(headers, "send_date")
 
-        normalized_headers = [normalize(h) for h in headers]
-        col_hotel = None
-        for alias in hotel_aliases:
-            if normalize(alias) in normalized_headers:
-                col_hotel = normalized_headers.index(normalize(alias))
-                break
+        col_hotel = find_hotel_col_index(headers)
 
         tab_matches = 0
-        unparsed_rows = []  # (hotel, raw period cell) - rows the real sync silently drops
+        unparsed_rows = []  # (hotel, raw period cell) - rows the real sync still drops
 
         for row in values[1:]:
-            if len(row) <= col_period:
-                continue
-            parsed_period = parse_billing_period(row[col_period])
+            raw_period = _cell(row, col_period)
+            parsed_period, inferred = resolve_billing_period(raw_period, _cell(row, col_hotel), ws.title)
             if not parsed_period:
                 hotel_raw = _cell(row, col_hotel).strip()
                 if hotel_raw:
-                    unparsed_rows.append((hotel_raw, row[col_period]))
+                    unparsed_rows.append((hotel_raw, raw_period))
                 continue
             if parsed_period[0] != billing_period:
                 continue
 
             found += 1
             tab_matches += 1
+            if inferred:
+                inferred_total += 1
             year = parsed_period[1]
             hotel = _cell(row, col_hotel) or "(no hotel name column found)"
 
@@ -703,6 +763,7 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
                 f"sent={sent_flag} send_date={send_date} | "
                 f"elapsed_business_days={elapsed} | eligible={eligible} met_sla={met_sla} "
                 f"| contributes_to_total_files_sent={sent_flag}"
+                + (" | period INFERRED from tab title (cell blank)" if inferred else "")
             )
 
         # Only report unparseable rows for tabs that actually hold this
@@ -710,18 +771,20 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
         if tab_matches and unparsed_rows:
             unparsed_by_tab[ws.title] = unparsed_rows
 
-    print(f"\n{found} row(s) found for billing period {billing_period}.")
+    print(f"\n{found} row(s) found for billing period {billing_period} "
+          f"({inferred_total} of them via tab-title fallback for a blank period cell).")
 
     if unparsed_by_tab:
         total_unparsed = sum(len(v) for v in unparsed_by_tab.values())
         print(f"\nUNPARSEABLE BILLING PERIOD - {total_unparsed} row(s) with a hotel name, on tabs "
-              f"that hold {billing_period}, whose Billing Period Analyzed cell didn't parse. The "
-              f"real sync silently drops these from every count:")
+              f"that hold {billing_period}, whose Billing Period Analyzed cell is filled in but didn't "
+              f"parse. The real sync drops these from every count - fix the cell on the sheet:")
         for title, rows in unparsed_by_tab.items():
             for hotel, raw in rows:
                 print(f"  [{title}] {hotel} | raw period cell: {raw!r}")
     else:
-        print("\nNo unparseable Billing Period Analyzed cells on the matching tab(s).")
+        print("\nNo unparseable Billing Period Analyzed cells on the matching tab(s) "
+              "(blank cells are handled by the tab-title fallback).")
 
     if unrecognized_sent_values:
         print(f"\nUNRECOGNIZED RESULTS-SENT VALUES - non-blank, not yes/true/y and not no/n/false, "
