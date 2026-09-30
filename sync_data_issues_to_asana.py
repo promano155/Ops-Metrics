@@ -66,8 +66,8 @@ this script has previously flagged (tracked via the Supabase dedup table),
 checks whether its Asana task is now completed. On completion, ONE uniform
 resolution applies regardless of which issue type originally flagged it:
 Data Uploaded -> Yes, Next Action -> "Processing Invoice", Request New Data
--> FALSE (cleared even if it wasn't this hotel's trigger - harmless no-op
-when the column was already blank/false) - the same default state any
+-> blank (cleared even if it wasn't this hotel's trigger - harmless no-op
+when the column was already blank) - the same default state any
 freshly-graduated hotel starts in. The hotel reappears in Work Queue, ready
 to work through normally (Mark as Sent is available regardless of
 Processing Status, so no distinct "resolved" label is needed). The dedup
@@ -749,7 +749,7 @@ def get_worksheet(spreadsheet, sheet_title, cache):
 def write_back_resolved_hotel(worksheet, hotel_name, dry_run=False):
     """One uniform resolution, regardless of which issue type flagged this
     hotel: Data Uploaded = Yes, Next Action = Processing Invoice, Request
-    New Data = FALSE - the same default state any freshly-graduated hotel
+    New Data = blank - the same default state any freshly-graduated hotel
     starts in. Lands it back in Work Queue, ready to work through normally
     (Mark as Sent is available the whole time regardless of Processing
     Status, so there's no need for a distinct "resolved" label). Clearing
@@ -780,7 +780,7 @@ def write_back_resolved_hotel(worksheet, hotel_name, dry_run=False):
         "Data Uploaded (Yes/No)": "Yes",
         "Upload Date": today,
         "Next Action": "🧾 Processing Invoice",
-        "Request New Data": "FALSE",
+        "Request New Data": "",
         "Last Updated By": "Asana Integration Sync",
     }
 
