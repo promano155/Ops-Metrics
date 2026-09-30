@@ -15,8 +15,11 @@ A row is flagged if ANY of these is true:
   - Processing Status (Next Action) contains "Data Issue"  -> Data Issue
   - Processing Status (Next Action) contains "Integration
     Issue"                                                 -> Integration Issue
-  - "Request New Data" checkbox = TRUE (own column,
-    independent of Data Uploaded/Next Action)               -> Request New Data
+  - Processing Status (Next Action) contains "Request New
+    Data"                                                    -> Request New Data (same mechanism as Data
+    Issue - Data Uploaded stays "yes"/"projection" the whole
+    time; this never pulls a hotel out of Work Queue's own
+    dataset, exactly like Data Issue/Awaiting Approval don't)
 
 Unlike the TEST project, the real "Data Processing Requests" project has no
 "Issue Type" custom field - it categorizes purely by which section a task
@@ -55,10 +58,10 @@ Issue, a different destination):
     independent staggering sequence distinct from both File Error/Data
     Issue's and Integration Issue's, so none of the three compress each
     other's deadlines.
-  - Setting this on the sheet (from either the landing page or Work Queue)
-    is expected to reset Data Uploaded (Yes/No) to blank at the same time -
-    that's handled on the Apps Script side, not here. This script only
-    reads the Request New Data column to decide whether to flag the row.
+  - Unlike an earlier version of this design, setting Request New Data
+    does NOT touch Data Uploaded (Yes/No) - it's a Processing Status value
+    exactly like Data Issue/Awaiting Approval, so the hotel never leaves
+    Work Queue's own dataset while pending.
 
 --- Write-back ---
 Runs first, before any new flagging, on every invocation. For every hotel
@@ -167,7 +170,6 @@ COLUMN_ALIASES = {
     "next_action": ["Next Action"],
     "send_by_date": ["Send by Date"],
     "data_automated": ["Data Automated"],
-    "request_new_data": ["Request New Data"],
 }
 
 # ---------------------------------------------------------------------------
@@ -321,7 +323,6 @@ def find_current_month_worksheet(values_by_title, target_month_key):
         col_next_action = find_col_index(headers, "next_action")
         col_send_by = find_col_index(headers, "send_by_date")
         col_data_automated = find_col_index(headers, "data_automated")
-        col_request_new_data = find_col_index(headers, "request_new_data")
         if col_period is None or col_hotel is None:
             continue
         for row in values[1:]:
@@ -329,8 +330,7 @@ def find_current_month_worksheet(values_by_title, target_month_key):
                 continue
             if parse_billing_period(row[col_period]) == target_month_key:
                 return (title, headers, col_period, col_hotel, col_priority,
-                         col_data_uploaded, col_next_action, col_send_by, col_data_automated,
-                         col_request_new_data)
+                         col_data_uploaded, col_next_action, col_send_by, col_data_automated)
     return None
 
 
@@ -889,8 +889,7 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         return
 
     (sheet_title, headers, col_period, col_hotel, col_priority,
-     col_data_uploaded, col_next_action, col_send_by, col_data_automated,
-     col_request_new_data) = found
+     col_data_uploaded, col_next_action, col_send_by, col_data_automated) = found
     data_rows = values_by_title[sheet_title][1:]
     print(f"Using worksheet '{sheet_title}' for {target_month}, {len(data_rows)} rows.")
     if col_data_uploaded is None:
@@ -908,9 +907,6 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
     if col_data_automated is None:
         print("WARNING: 'Data Automated' column was NOT found on this worksheet - "
               "the Data Automated field will not be set on any task this run.")
-    if col_request_new_data is None:
-        print("WARNING: 'Request New Data' column was NOT found on this worksheet - "
-              "Request New Data rows can never be detected.")
 
     if not dry_run:
         sections = get_asana_sections()
@@ -948,20 +944,18 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         next_action_value = (
             row[col_next_action].strip() if (col_next_action is not None and len(row) > col_next_action) else ""
         )
-        request_new_data_value = (
-            is_truthy(row[col_request_new_data]) if (col_request_new_data is not None and len(row) > col_request_new_data) else False
-        )
-
         is_file_error = data_uploaded_value.lower() == "error"
         is_integration_issue = "integration issue" in next_action_value.lower()
-        is_data_issue = (not is_integration_issue) and "data issue" in next_action_value.lower()
-        # Precedence when a row somehow matches more than one: File Error,
-        # then Integration Issue, then Data Issue, then Request New Data -
-        # an intake-time failure or a hand-off already in flight is more
-        # fundamental than a fresh data request.
-        is_request_new_data = (
-            request_new_data_value and not is_file_error and not is_integration_issue and not is_data_issue
+        is_request_new_data = (not is_integration_issue) and "request new data" in next_action_value.lower()
+        is_data_issue = (
+            not is_integration_issue and not is_request_new_data
+            and "data issue" in next_action_value.lower()
         )
+        # Precedence when a row somehow matches more than one: File Error,
+        # then Integration Issue, then Request New Data, then Data Issue -
+        # an intake-time failure or a hand-off already in flight is more
+        # fundamental than a fresh data request, which in turn is more
+        # specific than the generic Data Issue catch-all.
 
         if not is_file_error and not is_data_issue and not is_integration_issue and not is_request_new_data:
             continue  # not flagged - no action, by design
