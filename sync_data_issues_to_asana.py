@@ -15,9 +15,17 @@ A row is flagged if ANY of these is true:
   - Processing Status (Next Action) contains "Data Issue"  -> Data Issue
   - Processing Status (Next Action) contains "Integration
     Issue"                                                 -> Integration Issue
-These are recorded via a 3-option "Issue Type" custom field on the created
-task (File Error takes precedence if a row somehow matches more than one -
-an intake-time failure is the more fundamental problem).
+  - "Request New Data" checkbox = TRUE (own column,
+    independent of Data Uploaded/Next Action)               -> Request New Data
+
+Unlike the TEST project, the real "Data Processing Requests" project has no
+"Issue Type" custom field - it categorizes purely by which section a task
+sits in, so nothing is written to a custom field to record issue type
+anymore. (File Error/Data Issue/Integration Issue/Request New Data are
+still mutually exclusive per row - File Error takes precedence if a row
+somehow matches more than one, an intake-time failure being the more
+fundamental problem - but that precedence now only decides section
+placement, not a field value.)
 
 --- Routing ---
 File Error / Data Issue (unchanged from the first adapted version):
@@ -27,7 +35,7 @@ File Error / Data Issue (unchanged from the first adapted version):
     Priority (due_at = +24h); blank -> 48hr SLA, batched (25-cap, staggered
     due-date chaining, unchanged from the original script).
 
-Integration Issue (new - a fixed destination, not a Priority/48hr choice):
+Integration Issue (a fixed destination, not a Priority/48hr choice):
   - ALWAYS routes to "Transferred to Integrations", ignoring the Priority
     flag entirely - destination doesn't depend on urgency for this type.
   - Send by Date still determines the DUE DATE within that fixed
@@ -37,27 +45,50 @@ Integration Issue (new - a fixed destination, not a Priority/48hr choice):
     doesn't compress File Error/Data Issue's deadlines or vice versa -
     they're not competing for attention in the same section.
 
+Request New Data (new - same fixed-destination pattern as Integration
+Issue, a different destination):
+  - ALWAYS routes to "Email Contact", ignoring the Priority flag entirely,
+    for the same reason Integration Issue does - this is about who needs
+    to act (the hotel contact), not how urgent it is.
+  - Send by Date still determines the DUE DATE the same way: populated ->
+    due_at = +24h; blank -> batched (25-cap, staggered), with its OWN
+    independent staggering sequence distinct from both File Error/Data
+    Issue's and Integration Issue's, so none of the three compress each
+    other's deadlines.
+  - Setting this on the sheet (from either the landing page or Work Queue)
+    is expected to reset Data Uploaded (Yes/No) to blank at the same time -
+    that's handled on the Apps Script side, not here. This script only
+    reads the Request New Data column to decide whether to flag the row.
+
 --- Write-back ---
 Runs first, before any new flagging, on every invocation. For every hotel
 this script has previously flagged (tracked via the Supabase dedup table),
 checks whether its Asana task is now completed. On completion, ONE uniform
 resolution applies regardless of which issue type originally flagged it:
-Data Uploaded -> Yes, Next Action -> "Processing Invoice" - the same
-default state any freshly-graduated hotel starts in. The hotel reappears
-in Work Queue, ready to work through normally (Mark as Sent is available
-regardless of Processing Status, so no distinct "resolved" label is
-needed). The dedup record is then
-cleared so the hotel is eligible for a fresh flag if a new problem occurs.
+Data Uploaded -> Yes, Next Action -> "Processing Invoice", Request New Data
+-> FALSE (cleared even if it wasn't this hotel's trigger - harmless no-op
+when the column was already blank/false) - the same default state any
+freshly-graduated hotel starts in. The hotel reappears in Work Queue, ready
+to work through normally (Mark as Sent is available regardless of
+Processing Status, so no distinct "resolved" label is needed). The dedup
+record is then cleared so the hotel is eligible for a fresh flag if a new
+problem occurs.
 
 This is the first version of this script family that WRITES to Sheets, not
 just reads - requires the broadened SHEETS_SCOPES below, and the Google
 service account needs Editor (not just Viewer) access on the Invoice
 Horizon sheet.
 
---- Test-safe ---
-Points at the disposable TEST Asana project and _test-suffixed Supabase
-tables. Swap ASANA_PROJECT_GID and the three table-name constants once
-validated and ready to point at the real project.
+--- Production ---
+Points at the real "Data Processing Requests" Asana project and the
+production Supabase tables (no _test suffix). This is a one-way swap made
+2026-09-30 as part of the Invoice Horizon go-live - see
+INVOICE_HORIZON_CHANGELOG.md for the corresponding entry. If you need to
+validate a change against the disposable TEST project again, swap
+ASANA_PROJECT_GID and the four table-name constants back temporarily; the
+TEST project's Issue Type custom field no longer has an equivalent here
+(see the module docstring above), so code that relied on it needs the
+same production-shaped handling either way.
 """
 
 import os
@@ -87,25 +118,27 @@ SHEETS_MAX_RETRIES = 5
 
 ASANA_TOKEN = os.environ["ASANA_PAT"]
 
-# TEST PROJECT - swap to the real "Data Processing Requests" project
-# (1207448572741662) once validated. Section names/GIDs below are already
-# mirrored 1:1 in the real project.
-ASANA_PROJECT_GID = "1218503183805242"  # TEST - Data Processing Requests (Invoice Horizon)
+# PRODUCTION - "Data Processing Requests", swapped from the TEST project
+# 2026-09-30. NOT a 1:1 mirror of TEST's sections/fields - production has
+# no "Issue Type" custom field at all (categorization is by section alone;
+# see the module docstring) and several sections TEST never had (Ops
+# Feedback Required, Complete, Backlog, Blocked) that this script doesn't
+# touch.
+ASANA_PROJECT_GID = "1207448572741662"  # Data Processing Requests (production)
 PRIORITY_SECTION_NAME = "Priority (Within 24hrs)"     # Send by Date populated (File Error/Data Issue)
 STANDARD_SECTION_NAME = "48 hr SLA"                    # Send by Date blank (File Error/Data Issue)
-INTEGRATIONS_SECTION_GID = "1218507635372087"          # ALWAYS - Integration Issue, regardless of urgency
+INTEGRATIONS_SECTION_GID = "1217149563577019"          # ALWAYS - Integration Issue, regardless of urgency
+EMAIL_CONTACT_SECTION_GID = "1217149563577003"         # ALWAYS - Request New Data, regardless of urgency
 
-# "Data Automated" mirrors the sheet's checkbox column. Test project's
-# version has two options (Yes/No); only "Yes" is ever set, matching the
-# real project's single-option-workaround semantics either way.
-DATA_AUTOMATED_FIELD_GID = "1218503183888433"
-DATA_AUTOMATED_YES_OPTION_GID = "1218503183888434"
+# "Data Automated" mirrors the sheet's checkbox column. Production's
+# version has only one option (Yes); only "Yes" is ever set, so the
+# missing "No" option changes nothing here.
+DATA_AUTOMATED_FIELD_GID = "1217236216436084"
+DATA_AUTOMATED_YES_OPTION_GID = "1217236216436085"
 
-# Records which condition triggered the flag.
-ISSUE_TYPE_FIELD_GID = "1218503183888428"
-ISSUE_TYPE_FILE_ERROR_OPTION_GID = "1218503183888429"
-ISSUE_TYPE_DATA_ISSUE_OPTION_GID = "1218503183888430"
-ISSUE_TYPE_INTEGRATION_ISSUE_OPTION_GID = "1218503183888437"
+# No ISSUE_TYPE_* constants: production has no "Issue Type" custom field.
+# Which issue type triggered a task is recorded by section placement only
+# (see create_standalone_task and the module docstring).
 
 MONTH_NAMES = [
     'January','February','March','April','May','June',
@@ -116,10 +149,13 @@ BATCH_SIZE = 25
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-DEDUP_TABLE = "yellow_row_asana_tasks_test"
-BATCH_TABLE = "asana_batch_sections_test"
-STANDARD_BATCH_SEQUENCE_TABLE = "standard_sla_batch_sequence_test"
-STALE_RECREATION_LOG_TABLE = "stale_task_recreations_test"
+# Production table names (no _test suffix). CONFIRM these exist in
+# Supabase before the first real run - they were never created if the
+# _test-suffixed tables were the only ones set up during validation.
+DEDUP_TABLE = "yellow_row_asana_tasks"
+BATCH_TABLE = "asana_batch_sections"
+STANDARD_BATCH_SEQUENCE_TABLE = "standard_sla_batch_sequence"
+STALE_RECREATION_LOG_TABLE = "stale_task_recreations"
 
 TRUE_VALUES = {"true", "yes", "y", "1", "checked"}
 
@@ -131,6 +167,7 @@ COLUMN_ALIASES = {
     "next_action": ["Next Action"],
     "send_by_date": ["Send by Date"],
     "data_automated": ["Data Automated"],
+    "request_new_data": ["Request New Data"],
 }
 
 # ---------------------------------------------------------------------------
@@ -284,6 +321,7 @@ def find_current_month_worksheet(values_by_title, target_month_key):
         col_next_action = find_col_index(headers, "next_action")
         col_send_by = find_col_index(headers, "send_by_date")
         col_data_automated = find_col_index(headers, "data_automated")
+        col_request_new_data = find_col_index(headers, "request_new_data")
         if col_period is None or col_hotel is None:
             continue
         for row in values[1:]:
@@ -291,7 +329,8 @@ def find_current_month_worksheet(values_by_title, target_month_key):
                 continue
             if parse_billing_period(row[col_period]) == target_month_key:
                 return (title, headers, col_period, col_hotel, col_priority,
-                         col_data_uploaded, col_next_action, col_send_by, col_data_automated)
+                         col_data_uploaded, col_next_action, col_send_by, col_data_automated,
+                         col_request_new_data)
     return None
 
 
@@ -411,10 +450,12 @@ def find_section_gid(sections, name):
     )
 
 
-def create_standalone_task(hotel_name, month_key, section_gid, issue_type_option_gid,
-                            due_at=None, data_automated=False):
+def create_standalone_task(hotel_name, month_key, section_gid, due_at=None, data_automated=False):
     """Creates a hotel as a standalone TOP-LEVEL task directly in the
-    given section - no parent, no batch container, no subtask nesting."""
+    given section - no parent, no batch container, no subtask nesting.
+    Which issue type triggered this is recorded by section placement alone
+    (production has no Issue Type custom field - see module docstring),
+    so there's no issue_type_option_gid parameter anymore."""
     payload = {
         "data": {
             "name": hotel_name,
@@ -425,13 +466,8 @@ def create_standalone_task(hotel_name, month_key, section_gid, issue_type_option
     }
     if due_at:
         payload["data"]["due_at"] = due_at
-    custom_fields = {}
     if data_automated:
-        custom_fields[DATA_AUTOMATED_FIELD_GID] = DATA_AUTOMATED_YES_OPTION_GID
-    if issue_type_option_gid:
-        custom_fields[ISSUE_TYPE_FIELD_GID] = issue_type_option_gid
-    if custom_fields:
-        payload["data"]["custom_fields"] = custom_fields
+        payload["data"]["custom_fields"] = {DATA_AUTOMATED_FIELD_GID: DATA_AUTOMATED_YES_OPTION_GID}
     data = asana_request("POST", "/tasks", json=payload, params={"opt_fields": "due_at,due_on,name"})
     return data["gid"]
 
@@ -712,11 +748,13 @@ def get_worksheet(spreadsheet, sheet_title, cache):
 
 def write_back_resolved_hotel(worksheet, hotel_name, dry_run=False):
     """One uniform resolution, regardless of which issue type flagged this
-    hotel: Data Uploaded = Yes, Next Action = Processing Invoice - the same
-    default state any freshly-graduated hotel starts in. Lands it back in
-    Work Queue, ready to work through normally (Mark as Sent is available
-    the whole time regardless of Processing Status, so there's no need for
-    a distinct "resolved" label)."""
+    hotel: Data Uploaded = Yes, Next Action = Processing Invoice, Request
+    New Data = FALSE - the same default state any freshly-graduated hotel
+    starts in. Lands it back in Work Queue, ready to work through normally
+    (Mark as Sent is available the whole time regardless of Processing
+    Status, so there's no need for a distinct "resolved" label). Clearing
+    Request New Data here is a harmless no-op for hotels that were flagged
+    some other way and never had it set."""
     headers_row = worksheet.row_values(1)
     col_map = {h.strip(): i + 1 for i, h in enumerate(headers_row)}
 
@@ -742,6 +780,7 @@ def write_back_resolved_hotel(worksheet, hotel_name, dry_run=False):
         "Data Uploaded (Yes/No)": "Yes",
         "Upload Date": today,
         "Next Action": "🧾 Processing Invoice",
+        "Request New Data": "FALSE",
         "Last Updated By": "Asana Integration Sync",
     }
 
@@ -850,7 +889,8 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         return
 
     (sheet_title, headers, col_period, col_hotel, col_priority,
-     col_data_uploaded, col_next_action, col_send_by, col_data_automated) = found
+     col_data_uploaded, col_next_action, col_send_by, col_data_automated,
+     col_request_new_data) = found
     data_rows = values_by_title[sheet_title][1:]
     print(f"Using worksheet '{sheet_title}' for {target_month}, {len(data_rows)} rows.")
     if col_data_uploaded is None:
@@ -868,6 +908,9 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
     if col_data_automated is None:
         print("WARNING: 'Data Automated' column was NOT found on this worksheet - "
               "the Data Automated field will not be set on any task this run.")
+    if col_request_new_data is None:
+        print("WARNING: 'Request New Data' column was NOT found on this worksheet - "
+              "Request New Data rows can never be detected.")
 
     if not dry_run:
         sections = get_asana_sections()
@@ -887,10 +930,10 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
     # never creates a second task.
     open_hotel_task_names = build_open_hotel_task_names(project_tasks)
 
-    priority_flag_hotels = []   # (hotel_name, data_automated, issue_type_option_gid) - File Error/Data Issue, Priority=Yes
-    groups = {}                  # due_day_group -> [(hotel_name, data_automated, issue_type_option_gid)] - File Error/Data Issue, not Priority
-    integration_hotels = []      # (hotel_name, data_automated) - Integration Issue, ALWAYS this list regardless of Priority
-    integration_due_day_group = None  # set once we know which lane (24h fixed vs batched) integration hotels fall into this run
+    priority_flag_hotels = []   # (hotel_name, data_automated) - File Error/Data Issue, Priority=Yes
+    groups = {}                  # due_day_group -> [(hotel_name, data_automated)] - File Error/Data Issue, not Priority
+    integration_hotels = []      # (hotel_name, data_automated, due_day_group) - Integration Issue, ALWAYS this list regardless of Priority
+    request_new_data_hotels = [] # (hotel_name, data_automated, due_day_group) - Request New Data, ALWAYS this list regardless of Priority
 
     for row in data_rows:
         if len(row) <= col_period or len(row) <= col_hotel:
@@ -905,29 +948,23 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         next_action_value = (
             row[col_next_action].strip() if (col_next_action is not None and len(row) > col_next_action) else ""
         )
+        request_new_data_value = (
+            is_truthy(row[col_request_new_data]) if (col_request_new_data is not None and len(row) > col_request_new_data) else False
+        )
 
-       # Before
         is_file_error = data_uploaded_value.lower() == "error"
         is_integration_issue = "integration issue" in next_action_value.lower()
         is_data_issue = (not is_integration_issue) and "data issue" in next_action_value.lower()
-        
-        if not is_file_error and not is_data_issue and not is_integration_issue:
-            continue  # not flagged - no action, by design
-          # After
-        data_uploaded_lower = data_uploaded_value.lower()
-        is_file_error = data_uploaded_lower == "error"
-        is_integration_issue = data_uploaded_lower == "integration issue"
-        is_data_issue = "data issue" in next_action_value.lower()
-        
-        if not is_file_error and not is_data_issue and not is_integration_issue:
-            continue  # not flagged (includes Delayed Billing - deliberately no Asana trigger)
+        # Precedence when a row somehow matches more than one: File Error,
+        # then Integration Issue, then Data Issue, then Request New Data -
+        # an intake-time failure or a hand-off already in flight is more
+        # fundamental than a fresh data request.
+        is_request_new_data = (
+            request_new_data_value and not is_file_error and not is_integration_issue and not is_data_issue
+        )
 
-        if is_file_error:
-            issue_type_option_gid = ISSUE_TYPE_FILE_ERROR_OPTION_GID
-        elif is_integration_issue:
-            issue_type_option_gid = ISSUE_TYPE_INTEGRATION_ISSUE_OPTION_GID
-        else:
-            issue_type_option_gid = ISSUE_TYPE_DATA_ISSUE_OPTION_GID
+        if not is_file_error and not is_data_issue and not is_integration_issue and not is_request_new_data:
+            continue  # not flagged - no action, by design
 
         dedup_key = f"{sheet_title}:{hotel_name}"
         if already_actioned_with_legacy_fallback(sheet_title, target_month, hotel_name, dry_run=dry_run):
@@ -949,8 +986,14 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         # the due date (24h fixed vs batched) within that one destination.
         if is_integration_issue:
             this_due_day_group = "integration_overdue" if send_by_value else "integration_blank"
-            integration_due_day_group = this_due_day_group
             integration_hotels.append((hotel_name, data_automated_value, this_due_day_group))
+            continue
+
+        # Request New Data: same fixed-destination pattern as Integration
+        # Issue, routed to Email Contact instead.
+        if is_request_new_data:
+            this_due_day_group = "request_data_overdue" if send_by_value else "request_data_blank"
+            request_new_data_hotels.append((hotel_name, data_automated_value, this_due_day_group))
             continue
 
         # File Error / Data Issue: Priority=Yes bypasses due-date routing
@@ -959,13 +1002,13 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
             row[col_priority].strip() if (col_priority is not None and len(row) > col_priority) else ""
         )
         if priority_value.lower() == "yes":
-            priority_flag_hotels.append((hotel_name, data_automated_value, issue_type_option_gid))
+            priority_flag_hotels.append((hotel_name, data_automated_value))
             continue
 
         due_day_group = "overdue" if send_by_value else "blank"
-        groups.setdefault(due_day_group, []).append((hotel_name, data_automated_value, issue_type_option_gid))
+        groups.setdefault(due_day_group, []).append((hotel_name, data_automated_value))
 
-    if not priority_flag_hotels and not groups and not integration_hotels:
+    if not priority_flag_hotels and not groups and not integration_hotels and not request_new_data_hotels:
         print("No new flagged rows to action.")
         return
 
@@ -974,14 +1017,14 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
     if priority_flag_hotels:
         priority_due_at = (dt.datetime.utcnow() + dt.timedelta(hours=24)).replace(microsecond=0).isoformat() + "Z"
         if dry_run:
-            names_only = [h for h, _, _ in priority_flag_hotels]
+            names_only = [h for h, _ in priority_flag_hotels]
             print(f"[DRY RUN] Would create {len(priority_flag_hotels)} standalone task(s) "
                   f"in Priority (due_at={priority_due_at}): {names_only}")
         else:
-            for hotel_name, data_automated_value, issue_type_option_gid in priority_flag_hotels:
+            for hotel_name, data_automated_value in priority_flag_hotels:
                 dedup_key = f"{sheet_title}:{hotel_name}"
                 task_gid = create_standalone_task(
-                    hotel_name, target_month, priority_section_gid, issue_type_option_gid,
+                    hotel_name, target_month, priority_section_gid,
                     due_at=priority_due_at, data_automated=data_automated_value,
                 )
                 record_actioned(dedup_key, target_month, hotel_name, task_gid, "priority_flag", sheet_title=sheet_title)
@@ -1002,7 +1045,7 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
                 projected_due_at = (dt.datetime.utcnow() + dt.timedelta(hours=24)).replace(microsecond=0).isoformat() + "Z"
                 print(f"[DRY RUN] Group '{due_day_group}' -> section '{section_label}', "
                       f"would create {len(hotel_names)} standalone task(s) with due_at={projected_due_at}: "
-                      f"{[h for h, _, _ in hotel_names]}")
+                      f"{[h for h, _ in hotel_names]}")
                 continue
 
             state = get_batch_state(target_month, due_day_group)
@@ -1024,7 +1067,7 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
                 projected_due_at, seq = get_next_standard_batch_due_at(target_month, dry_run=True)
                 due_note = f"(would set due_at={projected_due_at}, sequence #{seq})"
             print(f"[DRY RUN] Group '{due_day_group}' -> section '{section_label}', {action} {due_note}, "
-                  f"would create {count_needed} standalone task(s): {[h for h, _, _ in hotel_names]}")
+                  f"would create {count_needed} standalone task(s): {[h for h, _ in hotel_names]}")
             continue
 
         if is_priority_group:
@@ -1034,10 +1077,10 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
                 target_month, due_day_group, len(hotel_names), apply_staggered_due_date=apply_staggered_due_date,
             )
 
-        for hotel_name, data_automated_value, issue_type_option_gid in hotel_names:
+        for hotel_name, data_automated_value in hotel_names:
             dedup_key = f"{sheet_title}:{hotel_name}"
             task_gid = create_standalone_task(
-                hotel_name, target_month, target_section_gid, issue_type_option_gid,
+                hotel_name, target_month, target_section_gid,
                 due_at=due_at, data_automated=data_automated_value,
             )
             record_actioned(dedup_key, target_month, hotel_name, task_gid, due_day_group, sheet_title=sheet_title)
@@ -1085,11 +1128,61 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
             for hotel_name, data_automated_value in hotel_names:
                 dedup_key = f"{sheet_title}:{hotel_name}"
                 task_gid = create_standalone_task(
-                    hotel_name, target_month, INTEGRATIONS_SECTION_GID, ISSUE_TYPE_INTEGRATION_ISSUE_OPTION_GID,
+                    hotel_name, target_month, INTEGRATIONS_SECTION_GID,
                     due_at=due_at, data_automated=data_automated_value,
                 )
                 record_actioned(dedup_key, target_month, hotel_name, task_gid, due_day_group, sheet_title=sheet_title)
                 print(f"Integration Issue '{due_day_group}' -> standalone task {task_gid} (due_at={due_at}) "
+                      f"for '{hotel_name}' (Data Automated={data_automated_value})")
+
+    # Pass 2d: Request New Data - ALWAYS the fixed Email Contact section.
+    # Exactly the same pattern as Pass 2c (Integration Issue), a different
+    # destination: Send by Date still governs due_at (24h fixed vs
+    # batched), and batched due dates use their OWN independent staggering
+    # sequence (sequence_key = "{month_key}:request_new_data") so they
+    # never compress File Error/Data Issue's or Integration Issue's
+    # deadlines, or vice versa.
+    if request_new_data_hotels:
+        by_group = {}
+        for hotel_name, data_automated_value, this_due_day_group in request_new_data_hotels:
+            by_group.setdefault(this_due_day_group, []).append((hotel_name, data_automated_value))
+
+        for due_day_group, hotel_names in by_group.items():
+            is_urgent = due_day_group == "request_data_overdue"
+            apply_staggered_due_date = not is_urgent
+            request_data_sequence_key = f"{target_month}:request_new_data"
+
+            if dry_run:
+                if is_urgent:
+                    projected_due_at = (dt.datetime.utcnow() + dt.timedelta(hours=24)).replace(microsecond=0).isoformat() + "Z"
+                    print(f"[DRY RUN] Request New Data group '{due_day_group}' -> 'Email Contact', "
+                          f"would create {len(hotel_names)} standalone task(s) with due_at={projected_due_at}: "
+                          f"{[h for h, _ in hotel_names]}")
+                else:
+                    projected_due_at, seq = get_next_standard_batch_due_at(request_data_sequence_key, dry_run=True)
+                    print(f"[DRY RUN] Request New Data group '{due_day_group}' -> 'Email Contact', "
+                          f"would batch {len(hotel_names)} standalone task(s) "
+                          f"(would set due_at={projected_due_at}, sequence #{seq}, sequence_key={request_data_sequence_key}): "
+                          f"{[h for h, _ in hotel_names]}")
+                continue
+
+            if is_urgent:
+                due_at = (dt.datetime.utcnow() + dt.timedelta(hours=24)).replace(microsecond=0).isoformat() + "Z"
+            else:
+                due_at = get_or_create_batch_due_at(
+                    target_month, due_day_group, len(hotel_names),
+                    apply_staggered_due_date=apply_staggered_due_date,
+                    sequence_key=request_data_sequence_key,
+                )
+
+            for hotel_name, data_automated_value in hotel_names:
+                dedup_key = f"{sheet_title}:{hotel_name}"
+                task_gid = create_standalone_task(
+                    hotel_name, target_month, EMAIL_CONTACT_SECTION_GID,
+                    due_at=due_at, data_automated=data_automated_value,
+                )
+                record_actioned(dedup_key, target_month, hotel_name, task_gid, due_day_group, sheet_title=sheet_title)
+                print(f"Request New Data '{due_day_group}' -> standalone task {task_gid} (due_at={due_at}) "
                       f"for '{hotel_name}' (Data Automated={data_automated_value})")
 
 
