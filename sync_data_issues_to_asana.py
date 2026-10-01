@@ -728,13 +728,21 @@ def get_tracked_open_tasks():
 
 
 def get_task_completion(task_gid):
-    """Returns True/False, or None if the task no longer exists (404) -
-    left alone here; already_actioned()'s existing stale-record cleanup
-    handles that case on the next normal flagging pass, below."""
+    """Returns True/False, or None if the task can't be resolved (404, or
+    403 - some workspace/project access issue, most often a stale
+    reference left over from before this script pointed here). Left alone
+    here; already_actioned()'s existing stale-record cleanup handles 404
+    on the next normal flagging pass. A 403 isn't cleaned up automatically
+    (unlike a confirmed-gone 404, "can't see it" isn't proof it's actually
+    gone) - it's just skipped so one bad row can't crash the whole run."""
     url = f"https://app.asana.com/api/1.0/tasks/{task_gid}"
     params = {"opt_fields": "completed"}
     resp = requests.get(url, headers=asana_headers(), params=params, timeout=30)
-    if resp.status_code == 404:
+    if resp.status_code in (404, 403):
+        if resp.status_code == 403:
+            print(f"WARNING: Asana returned 403 for task {task_gid} - skipping (likely a stale "
+                  f"reference from before this script pointed at the current project; investigate "
+                  f"and clear the dedup_key by hand if this keeps happening for the same task).")
         return None
     resp.raise_for_status()
     return resp.json()["data"].get("completed", False)
