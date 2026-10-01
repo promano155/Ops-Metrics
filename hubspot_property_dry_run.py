@@ -11,7 +11,7 @@
 import requests, time, csv, getpass
 
 TOKEN = getpass.getpass("Paste your HubSpot private app token: ")
-HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+HEADERS = {"Authorization": f"Bearer {pat-na1-988357be-19e3-49ff-85d9-3f2b1bba8f97}", "Content-Type": "application/json"}
 BASE = "https://api.hubapi.com"
 
 OBJECTS = ["companies", "contacts", "deals"]
