@@ -30,7 +30,7 @@ unless you are testing, because they need the secrets listed below.
 | `SLA_breach_digest.yml` | `sla_breach_digest.py` | External cron | One Slack message listing tasks currently past their SLA. |
 | `daily_completion_digest.yml` | `daily_completions_digest.py` | GitHub cron, Mon-Thu 12:00 UTC | Slack digest: completed this week and month, plus what is in progress and for how long. |
 | `javi-friday-digest.yml` | `sync_ops_task_tracker.py` | GitHub cron, Mon-Fri 12:00 UTC | Daily sync of the ad-hoc ops task project, with a Friday-only Slack summary. |
-| `daily_duplicate_digest.yml` | `daily_duplicate_digest.py` | GitHub cron, daily 12:00 UTC | Slack digest of duplicate hotel tasks. Only deletes them if `AUTO_DEDUPE` is `true`. |
+| `daily_duplicate_digest.yml` | `daily_duplicate_digest.py` | GitHub cron, daily 12:00 UTC | Slack digest of duplicate hotel tasks, found among subtasks of batch parents only. Only deletes them if `AUTO_DEDUPE` is `true`. |
 | `decouple_moved_subtasks.yml` | `decouple_moved_subtasks.py` | GitHub cron, daily 12:00 UTC | Detaches subtasks from active parent tasks. Preview only unless `AUTO_DECOUPLE` is `true`. |
 
 ### Manual-only workflows
@@ -43,14 +43,6 @@ unless you are testing, because they need the secrets listed below.
 | `manual-reports-sent-sync.yml` | `sync_reports_sent_monthly.py` | Re-run the reports-sent sync on demand. |
 | `manual-sync-data-issues-to-asana.yml` | `sync_data_issues_to_asana.py` | Test the data-issues sync against a specific past month. |
 | `sync-asana-only.yml` | `sync_yellow_rows_to_asana.py` | Push flagged billing rows to Asana without the rest of the daily run. |
-| `find_dups.yml` | `find_duplicate_hotel_tasks.py` | Read-only report of duplicate hotel tasks. Safe to run any time. |
-| `delete_dupes.yml` | `delete_duplicate_hotel_tasks.py` | **Deletes** duplicate tasks. Irreversible. Run with dry-run first. |
-| `backfill_monthly.yml` | `backfill_revenue_impact.py` | One-time backfill of an empty field on open tasks. Writes to live tasks. Run with dry-run first. |
-
-## Not currently run by any workflow
-
-- `sync_hubspot_reconciliations_monthly.py` is an older version of the reconciliation
-  sync that was replaced by `sync_reconciliations_monthly.py`. It is kept for reference only.
 
 ## Settings the workflows depend on
 
@@ -78,7 +70,7 @@ Set these under **Settings > Secrets and variables > Actions**.
 
 - **Never put a token, key, or password in a script.** Always add it as an Actions secret
   and read it from the environment. Rotate anything that was ever committed, even briefly.
-- **Dry-run first** for anything that deletes or bulk-edits (`delete_duplicate_hotel_tasks.py`,
-  `backfill_revenue_impact.py`).
+- **Dry-run first** for anything that deletes or bulk-edits. The manual workflows have a
+  `dry_run` option; leave it on until the output looks right.
 - Every workflow has a `timeout-minutes` limit, so a stuck run stops on its own. If a
   legitimate run gets cancelled for taking too long, raise the limit in that workflow file.
