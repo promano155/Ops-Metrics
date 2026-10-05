@@ -30,8 +30,6 @@ unless you are testing, because they need the secrets listed below.
 | `SLA_breach_digest.yml` | `sla_breach_digest.py` | External cron | One Slack message listing tasks currently past their SLA. |
 | `daily_completion_digest.yml` | `daily_completions_digest.py` | GitHub cron, Mon-Thu 12:00 UTC | Slack digest: completed this week and month, plus what is in progress and for how long. |
 | `javi-friday-digest.yml` | `sync_ops_task_tracker.py` | GitHub cron, Mon-Fri 12:00 UTC | Daily sync of the ad-hoc ops task project, with a Friday-only Slack summary. |
-| `daily_duplicate_digest.yml` | `daily_duplicate_digest.py` | GitHub cron, daily 12:00 UTC | Slack digest of duplicate hotel tasks, found among subtasks of batch parents only. Only deletes them if `AUTO_DEDUPE` is `true`. |
-| `decouple_moved_subtasks.yml` | `decouple_moved_subtasks.py` | GitHub cron, daily 12:00 UTC | Detaches subtasks from active parent tasks. Preview only unless `AUTO_DECOUPLE` is `true`. |
 
 ### Manual-only workflows
 
@@ -58,13 +56,6 @@ Set these under **Settings > Secrets and variables > Actions**.
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Reading the Google Sheets the syncs use. |
 | `GMAIL_OAUTH_CLIENT_ID`, `GMAIL_OAUTH_CLIENT_SECRET`, `GMAIL_OAUTH_REFRESH_TOKEN` | Reading reconciliation emails. |
 | `SLACK_BOT_TOKEN` | Posting digests. |
-
-**Variables** (both default to off)
-
-| Name | Effect when set to `true` |
-| --- | --- |
-| `AUTO_DEDUPE` | The daily duplicate digest also deletes the duplicates it finds. |
-| `AUTO_DECOUPLE` | The decouple workflow actually detaches subtasks instead of only previewing. |
 
 ## Rules of thumb
 
