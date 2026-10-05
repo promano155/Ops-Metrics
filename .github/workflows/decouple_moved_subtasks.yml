@@ -16,6 +16,7 @@ jobs:
   decouple:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
