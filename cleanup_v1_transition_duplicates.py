@@ -18,26 +18,53 @@ place for manual review:
 
 That's the right call for ongoing operation (a second task for an
 already-completed hotel can be legitimate new work - a new billing
-cycle, a reopened data issue). But the V1-to-new-UI transition created
-a batch of these specifically because some hotels were created AND
+cycle, a reopened data issue). The V1-to-new-UI transition created a
+batch of these specifically because some hotels were created AND
 resolved entirely by hand during that window, with no Supabase dedup
 record and no longer an open task - invisible to every automated check,
 so the pipeline (reasonably) treated them as new and duplicated them.
 This script is the one-time manual pass to clear that specific backlog.
 
+--- FIXED: same-name != same-cycle ---
+An earlier version of this script grouped ALL tasks by name, with no
+time bound, and treated every group-with-a-completed-earliest-task as
+a duplicate to clean up. That's wrong for any hotel that is legitimately
+flagged every month (confirmed real case: "Park Shore Waikiki" had four
+separate, correctly-completed tasks from four different billing
+cycles - Aug, two in Sep, and Oct - which the old logic would have
+deleted down to one, destroying real historical work records, not
+cleaning up a duplicate at all. The script had no way to distinguish
+"same hotel, same cycle, created twice by accident" from "same hotel,
+different cycles, each correctly actioned once," because it only
+looked at name and creation order with no concept of billing period.
+
+Fix: this script now ONLY considers tasks created on/after CUTOFF_DATE
+(default 2026-10-01, the start of the window the V1-transition manual
+work actually happened in) for duplicate grouping. Tasks created before
+the cutoff are excluded entirely before grouping even starts - not just
+filtered out of the delete list, but never considered when forming
+groups at all. This means a hotel like Park Shore Waikiki, which has
+only ONE task falling inside the cutoff window, has nothing to group
+with and never shows up as a "duplicate" in the first place. Legitimate
+monthly recurrence almost never produces two tasks for the same hotel
+within this narrow a window, while the actual V1-transition duplicates
+were all created close together within it - so restricting the
+candidate pool by date, rather than trying to infer intent from notes
+or other heuristics, is what actually separates the two cases here.
+
 --- Scope ---
-- Finds every group of tasks in the project sharing the same hotel name
-  (after stripping any "IGNORE" prefix - see NORMALIZE below), the same
-  way the regular sweep does.
-- Reports EVERY duplicate-name group found, regardless of whether any
-  task in it carries an "IGNORE" prefix - Pia flagged a few manually
-  while this was being tracked down, but there may be others she didn't
-  catch, so this does not limit itself to IGNORE-tagged groups.
-- Only DELETES from groups where the earliest-created task is already
-  COMPLETED (the specific gap described above). Groups where the
-  earliest is still OPEN are reported for visibility only and never
-  touched here - those are the regular daily sweep's job, not this
-  script's, to avoid the two overlapping.
+- Among tasks created on/after CUTOFF_DATE only: finds every group of
+  tasks sharing the same hotel name (after stripping any "IGNORE"
+  prefix - see NORMALIZE below), the same way the regular sweep does.
+- Reports EVERY duplicate-name group found within that window,
+  regardless of whether any task in it carries an "IGNORE" prefix - Pia
+  flagged a few manually while this was being tracked down, but there
+  may be others she didn't catch, so this does not limit itself to
+  IGNORE-tagged groups.
+- Only DELETES from groups where the earliest-created task (within the
+  window) is already COMPLETED. Groups where the earliest is still OPEN
+  are reported for visibility only and never touched here - those are
+  the regular daily sweep's job, not this script's.
 
 --- IGNORE prefix handling ---
 Pia prefixed a few flagged hotel names with "IGNORE" (e.g. "IGNORE
@@ -51,9 +78,10 @@ ones were manually marked.
 
 --- Safe-by-default ---
 Dry-run is the default. Nothing is deleted until you pass --confirm.
-Even with --confirm, only duplicates from completed-earliest groups are
-removed - the earliest (kept) task in every group is never touched,
-and open-earliest groups are never touched by this script at all.
+Even with --confirm, only duplicates from completed-earliest groups
+within the cutoff window are removed - the earliest (kept) task in
+every group is never touched, open-earliest groups are never touched,
+and anything created before CUTOFF_DATE is never even considered.
 """
 
 import os
@@ -66,6 +94,12 @@ import requests
 ASANA_TOKEN = os.environ["ASANA_PAT"]
 ASANA_PROJECT_GID = "1207448572741662"  # Data Processing Requests
 
+# Only tasks created ON OR AFTER this date are considered for duplicate
+# grouping at all - see the "FIXED: same-name != same-cycle" note above
+# for why this matters. Confirmed with Pia 2026-10-07: restrict to
+# tasks created since 10/1, the start of the V1-transition window.
+CUTOFF_DATE = dt.date(2026, 10, 1)
+
 _IGNORE_PREFIX_RE = re.compile(r"^\s*ignore\s*[:\-]?\s*", re.IGNORECASE)
 
 
@@ -76,6 +110,12 @@ def normalize_name(raw_name):
     this is only about the one marker Pia added, not general name
     cleanup."""
     return _IGNORE_PREFIX_RE.sub("", raw_name).strip()
+
+
+def parse_asana_created_at(value):
+    """Asana's created_at comes back like '2026-09-17T15:33:59.685Z'.
+    Returns a date() for comparing against CUTOFF_DATE."""
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).date()
 
 
 def asana_headers():
@@ -100,7 +140,10 @@ def fetch_all_project_tasks(project_gid):
     """Paginates through every TOP-LEVEL task in the project. Same
     approach as sync_yellow_rows_to_asana.py's fetch_all_project_tasks -
     this project uses standalone tasks only, so a single top-level
-    listing is complete."""
+    listing is complete. Fetches the full history (no date filter at
+    the API level) - the CUTOFF_DATE filter is applied client-side in
+    main(), after fetching, so the raw task list stays reusable/
+    inspectable if needed."""
     tasks = []
     params = {"project": project_gid, "opt_fields": "name,created_at,completed", "limit": 100}
     url = "https://app.asana.com/api/1.0/tasks"
@@ -130,15 +173,29 @@ def delete_asana_task(task_gid):
     asana_request("DELETE", f"/tasks/{task_gid}")
 
 
-def find_duplicate_groups(tasks):
+def find_duplicate_groups(tasks, cutoff_date):
     """Groups tasks by normalized name (IGNORE-prefix stripped - see
-    normalize_name). Returns {normalized_name: [task, ...]} for every
-    name with more than one task, sorted earliest-created first within
+    normalize_name), considering ONLY tasks created on/after
+    cutoff_date. A task created before the cutoff is excluded entirely
+    before grouping - it doesn't even count as a sibling for some other
+    task that IS within the window, since including it would reintroduce
+    exactly the same-name-but-different-cycle false positive this
+    script was fixed to avoid (see module docstring).
+
+    Returns {normalized_name: [task, ...]} for every name with more than
+    one task WITHIN THE WINDOW, sorted earliest-created first within
     each group."""
     by_name = {}
+    excluded_count = 0
     for t in tasks:
+        if parse_asana_created_at(t["created_at"]) < cutoff_date:
+            excluded_count += 1
+            continue
         key = normalize_name(t["name"])
         by_name.setdefault(key, []).append(t)
+
+    print(f"{excluded_count} task(s) created before {cutoff_date.isoformat()} excluded from "
+          f"consideration entirely (not grouped, not reported, not touched).")
 
     duplicates = {}
     for key, group in by_name.items():
@@ -148,14 +205,15 @@ def find_duplicate_groups(tasks):
     return duplicates
 
 
-def main(confirm=False):
+def main(confirm=False, cutoff_date=CUTOFF_DATE):
     print(f"Fetching all tasks in project {ASANA_PROJECT_GID}...")
     tasks = fetch_all_project_tasks(ASANA_PROJECT_GID)
-    print(f"Fetched {len(tasks)} top-level tasks.\n")
+    print(f"Fetched {len(tasks)} top-level tasks total.\n")
 
-    duplicate_groups = find_duplicate_groups(tasks)
+    duplicate_groups = find_duplicate_groups(tasks, cutoff_date)
     if not duplicate_groups:
-        print("No duplicate-name groups found. Nothing to do.")
+        print(f"\nNo duplicate-name groups found among tasks created on/after "
+              f"{cutoff_date.isoformat()}. Nothing to do.")
         return
 
     completed_earliest_groups = {}
@@ -168,9 +226,10 @@ def main(confirm=False):
             open_earliest_groups[key] = group
 
     if open_earliest_groups:
-        print(f"SKIPPING {len(open_earliest_groups)} group(s) where the earliest task is still OPEN - "
-              f"these are the regular daily pipeline's job (sweep_duplicate_hotel_tasks), not this "
-              f"script's. Listed for visibility only, nothing touched:")
+        print(f"\nSKIPPING {len(open_earliest_groups)} group(s) where the earliest task (within "
+              f"the window) is still OPEN - these are the regular daily pipeline's job "
+              f"(sweep_duplicate_hotel_tasks), not this script's. Listed for visibility only, "
+              f"nothing touched:")
         for key, group in open_earliest_groups.items():
             keeper = group[0]
             dupes = group[1:]
@@ -178,14 +237,15 @@ def main(confirm=False):
             tag_note = " [includes an IGNORE-tagged task]" if any_ignore_tagged else ""
             print(f"  '{key}'{tag_note}: keeper {keeper['gid']} (open, created {keeper['created_at']}), "
                   f"{len(dupes)} duplicate(s): {[d['gid'] for d in dupes]}")
-        print()
 
     if not completed_earliest_groups:
-        print("No completed-earliest duplicate groups found - nothing for this script to clean up.")
+        print(f"\nNo completed-earliest duplicate groups found within the "
+              f"{cutoff_date.isoformat()}-onward window - nothing for this script to clean up.")
         return
 
-    print(f"Found {len(completed_earliest_groups)} group(s) where the earliest task is COMPLETED "
-          f"- these are the ones left in place by the regular sweep, and what this script targets:\n")
+    print(f"\nFound {len(completed_earliest_groups)} group(s), among tasks created on/after "
+          f"{cutoff_date.isoformat()}, where the earliest task is COMPLETED - these are the ones "
+          f"left in place by the regular sweep, and what this script targets:\n")
 
     total_to_delete = 0
     for key, group in completed_earliest_groups.items():
@@ -233,5 +293,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--confirm", action="store_true",
                          help="Actually delete duplicates. Without this flag, only reports what would happen.")
+    parser.add_argument("--since", type=str, default=None,
+                         help="Override the cutoff date (YYYY-MM-DD). Only tasks created on/after this "
+                              "date are considered. Default: 2026-10-01.")
     args = parser.parse_args()
-    main(confirm=args.confirm)
+    cutoff = dt.date.fromisoformat(args.since) if args.since else CUTOFF_DATE
+    main(confirm=args.confirm, cutoff_date=cutoff)
