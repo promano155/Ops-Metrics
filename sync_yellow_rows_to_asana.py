@@ -110,6 +110,7 @@ import time
 import calendar
 import datetime as dt
 
+import gspread
 import requests
 from google.oauth2.service_account import Credentials
 
@@ -120,6 +121,19 @@ from google.oauth2.service_account import Credentials
 SHEET_ID = "10osrvx4zsemAQy3rAci2tbV3cAzRBSM8ocecbnuw76I"
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
+# The workbook has 90+ tabs (and growing). Reading each one with
+# get_all_values() in a tight loop can hit the Sheets API's per-minute
+# read quota - see sync_data_processing_metrics.py, which hit exactly
+# this and silently skipped most tabs, with only one making it into
+# Supabase. This script previously had no retry logic on that failure
+# at all: a single 429 partway through would skip every REMAINING
+# worksheet with no retry, including the current month's tab, which is
+# how a transient rate limit turned into a total "nothing to do" run.
+# Every read is now retried with backoff on rate-limit errors, matching
+# the fix already proven in sync_data_processing_metrics.py.
+SHEETS_REQUEST_DELAY_SECONDS = 1.1
+SHEETS_MAX_RETRIES = 5
 
 ASANA_TOKEN = os.environ["ASANA_PAT"]
 ASANA_PROJECT_GID = "1207448572741662"  # Data Processing Requests
@@ -165,6 +179,37 @@ COLUMN_ALIASES = {
 def get_credentials():
     creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     return Credentials.from_service_account_info(creds_dict, scopes=SHEETS_SCOPES)
+
+
+def get_all_values_with_retry(ws):
+    """Reads a worksheet's values, retrying with backoff on rate-limit
+    errors instead of silently giving up. Ported from
+    sync_data_processing_metrics.py, which hit this exact failure first:
+    a plain try/except around get_all_values() swallowed 429s across
+    dozens of tabs, and only one tab's data ever made it through. In
+    THIS script the consequence is worse than a missing data point -
+    once one worksheet hits an unretried 429, every subsequent
+    worksheet in the loop (including whichever one is the current
+    month's tab) gets skipped too, since the quota window doesn't clear
+    mid-run - turning a transient rate limit into "could not find ANY
+    parseable billing period across the whole sheet" and a completely
+    empty run."""
+    for attempt in range(SHEETS_MAX_RETRIES):
+        try:
+            values = ws.get_all_values()
+            time.sleep(SHEETS_REQUEST_DELAY_SECONDS)
+            return values
+        except gspread.exceptions.APIError as e:
+            status = getattr(e.response, "status_code", None)
+            is_rate_limit = status == 429 or (
+                e.response is not None and "RESOURCE_EXHAUSTED" in e.response.text
+            )
+            if not is_rate_limit:
+                raise
+            wait = (2 ** attempt) * 2
+            print(f"Sheets API rate limited reading '{ws.title}', waiting {wait}s (attempt {attempt + 1}/{SHEETS_MAX_RETRIES})")
+            time.sleep(wait)
+    raise RuntimeError(f"Still rate limited reading '{ws.title}' after {SHEETS_MAX_RETRIES} retries")
 
 
 def parse_utc_datetime(value):
@@ -337,6 +382,123 @@ def asana_request(method, path, **kwargs):
 
 def get_asana_sections():
     return asana_request("GET", f"/projects/{ASANA_PROJECT_GID}/sections")
+
+
+def fetch_all_project_tasks(project_gid):
+    """Paginates through every TOP-LEVEL task currently in the project.
+    This project uses standalone tasks only (see the module docstring -
+    every hotel is created directly in a section, no parent/subtask
+    nesting at all), so a single top-level listing is a complete
+    picture of every hotel task that exists right now. This is
+    deliberately NOT built on top of find_duplicate_hotel_tasks.py /
+    delete_duplicate_hotel_tasks.py, which are still written for the
+    retired parent+subtask design and only ever scan SUBTASKS of
+    top-level parents - under the current standalone-task design they
+    would never see a duplicate at all, since there's no parent for the
+    duplicates to be subtasks of."""
+    tasks = []
+    params = {"project": project_gid, "opt_fields": "name,created_at,completed", "limit": 100}
+    url = "https://app.asana.com/api/1.0/tasks"
+    while True:
+        for attempt in range(5):
+            resp = requests.get(url, headers=asana_headers(), params=params, timeout=30)
+            if resp.status_code == 429:
+                wait = float(resp.headers.get("Retry-After", 2 ** attempt))
+                print(f"Asana rate limited fetching tasks, waiting {wait}s (attempt {attempt + 1}/5)")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
+        else:
+            raise RuntimeError("Asana still rate limited after 5 retries while fetching tasks")
+        body = resp.json()
+        tasks.extend(body["data"])
+        next_page = body.get("next_page")
+        if not next_page:
+            break
+        params = {**params, "offset": next_page["offset"]}
+        time.sleep(0.3)
+    return tasks
+
+
+def delete_asana_task(task_gid):
+    asana_request("DELETE", f"/tasks/{task_gid}")
+
+
+def sweep_duplicate_hotel_tasks(tasks, dry_run=False):
+    """Scans every top-level task currently in the project, groups them
+    by EXACT name match, and for any hotel with more than one task,
+    always favors the first entry: the earliest-created task is kept,
+    and every later task with the identical name is swept (deleted).
+
+    This only sweeps when the kept (earliest) task is still OPEN. If the
+    earliest task is already completed, duplicates are left untouched -
+    a second task for an already-completed hotel could be legitimate
+    new work (a different billing cycle, a reopened data issue), not an
+    actual duplicate, so this is left for a human to judge rather than
+    auto-deleted.
+
+    This is a name-based sweep independent of the Supabase dedup table -
+    it catches duplicates regardless of how they were created (via this
+    script, manually, or from a stale dedup record before this or a
+    prior fix), and complements rather than replaces the dedup_key
+    checks in already_actioned_with_legacy_fallback().
+
+    Takes the project's current task list as a parameter (fetched once
+    in main() and shared with has_open_task_for_hotel below) rather than
+    fetching it itself, so a single run only pulls the full task list
+    from Asana once."""
+    by_name = {}
+    for t in tasks:
+        by_name.setdefault(t["name"], []).append(t)
+
+    any_swept = False
+    for name, group in by_name.items():
+        if len(group) < 2:
+            continue
+        group_sorted = sorted(group, key=lambda t: t["created_at"])
+        keeper, duplicates = group_sorted[0], group_sorted[1:]
+
+        if keeper["completed"]:
+            print(f"'{name}': {len(duplicates)} duplicate(s) found, but the earliest task "
+                  f"({keeper['gid']}) is already completed - leaving duplicates in place for "
+                  f"manual review rather than assuming a completed hotel's extra task is a "
+                  f"true duplicate.")
+            continue
+
+        any_swept = True
+        for dup in duplicates:
+            if dry_run:
+                print(f"[DRY RUN] Would sweep duplicate task {dup['gid']} for '{name}' "
+                      f"(keeping earliest task {keeper['gid']}, created {keeper['created_at']}).")
+            else:
+                delete_asana_task(dup["gid"])
+                print(f"Swept duplicate task {dup['gid']} for '{name}' "
+                      f"(kept earliest task {keeper['gid']}, created {keeper['created_at']}).")
+
+    if not any_swept:
+        print("Duplicate sweep: no open-and-duplicated hotel tasks found.")
+
+
+def build_open_hotel_task_names(tasks):
+    """Returns the set of hotel names that currently have AT LEAST ONE
+    OPEN task in the project, regardless of which month/dedup key
+    created it.
+
+    The dedup_key check in already_actioned_with_legacy_fallback only
+    ever asks "does THIS MONTH already have a record for this hotel?" -
+    it has no concept of whether last month's task ever got resolved.
+    A hotel is supposed to get a new task each month (each billing
+    period is genuinely separate work), but only once the PREVIOUS
+    month's task is actually closed out - not just because a new
+    month's row got flagged while the old task is still sitting open.
+    Without this check, a hotel whose prior task drags on unresolved
+    gets ANOTHER task piled on top of it every time the sheet rolls to
+    a new month, rather than the existing one just carrying forward.
+
+    Built from the same task list sweep_duplicate_hotel_tasks already
+    fetched, so this costs no extra Asana calls."""
+    return {t["name"] for t in tasks if not t["completed"]}
 
 
 def find_section_gid(sections, name):
@@ -723,17 +885,15 @@ def get_or_create_batch_due_at(month_key, due_day_group, count_needed, apply_sta
 def main(dry_run=False, month_override=None, as_of_day_override=None):
     creds = get_credentials()
 
-    import gspread
     gc = gspread.authorize(creds)
     spreadsheet = gc.open_by_key(SHEET_ID)
 
     values_by_title = {}
     for ws in spreadsheet.worksheets():
         try:
-            values_by_title[ws.title] = ws.get_all_values()
-            time.sleep(1.1)
+            values_by_title[ws.title] = get_all_values_with_retry(ws)
         except Exception as e:
-            print(f"Skipping worksheet '{ws.title}': {e}")
+            print(f"Skipping worksheet '{ws.title}' after retries failed: {e}")
 
     if month_override:
         target_month = month_override
@@ -790,6 +950,25 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         priority_section_gid = "DRY_RUN_PRIORITY_SECTION"
         standard_section_gid = "DRY_RUN_STANDARD_SECTION"
 
+    # Fetch the project's current tasks ONCE, shared between the
+    # duplicate sweep and the open-task guard below - both are name-based
+    # checks over the same live Asana state, so there's no reason to
+    # pull the full task list from Asana twice in one run.
+    project_tasks = fetch_all_project_tasks(ASANA_PROJECT_GID)
+
+    # Sweep existing duplicate hotel tasks BEFORE looking at the sheet at
+    # all - this is independent of what's flagged this run. Catches
+    # duplicates from any source (this script, manual creation, or a
+    # stale dedup record from before the existence-check fix), always
+    # keeping the earliest task and only when that earliest task is
+    # still open (see sweep_duplicate_hotel_tasks docstring).
+    sweep_duplicate_hotel_tasks(project_tasks, dry_run=dry_run)
+
+    # Hotels with an open task from ANY prior month/run - a new task
+    # should never be created for these until the existing one is
+    # actually resolved (see build_open_hotel_task_names docstring).
+    open_hotel_task_names = build_open_hotel_task_names(project_tasks)
+
     # Pass 1: figure out which rows are new (Flag to Innova checked, not
     # yet actioned). Split into two paths:
     #  - Data Priority = Yes -> nested under a time-bucketed summary
@@ -824,6 +1003,16 @@ def main(dry_run=False, month_override=None, as_of_day_override=None):
         dedup_key = f"{sheet_title}:{hotel_name}"
         if already_actioned_with_legacy_fallback(sheet_title, target_month, hotel_name, dry_run=dry_run):
             # read-only either way, safe in dry-run
+            continue
+
+        if hotel_name in open_hotel_task_names:
+            # This month's dedup key looks new, but the hotel already has
+            # an unresolved task sitting open from a prior month/run.
+            # Monthly recurrence should pick up again once that task is
+            # actually closed out, not pile a new one on top of it while
+            # it's still open (see build_open_hotel_task_names docstring).
+            print(f"Skipping '{hotel_name}' - already has an open task in the project "
+                  f"from a previous cycle; won't create another until that one is resolved.")
             continue
 
         data_automated_value = (
