@@ -1,0 +1,38 @@
+# Move this file to .github/workflows/cleanup-v1-duplicates.yml in your repo.
+# This is a ONE-TIME cleanup workflow - no schedule, manual trigger only.
+# Safe to delete once you've run the cleanup and confirmed the results.
+
+name: Cleanup V1 transition duplicates (one-time)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Actually delete duplicates (leave UNCHECKED for a dry run first)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run cleanup script
+        env:
+          ASANA_PAT: ${{ secrets.ASANA_PAT }}
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" = "true" ]; then
+            python cleanup_v1_transition_duplicates.py --confirm
+          else
+            python cleanup_v1_transition_duplicates.py
+          fi
