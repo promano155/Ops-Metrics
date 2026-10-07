@@ -2,52 +2,95 @@
 sync_data_processing_metrics.py
 
 Pulls the hotel billing tracker tabs from the "Curacity Billing Overview"
-Google Sheet, computes the "7 business day" data-processing SLA metrics
-per billing month, and upserts the results into Supabase so the Lovable
-dashboard can read them instead of relying on manual entry.
+Google Sheet, computes data-processing throughput metrics per billing
+month, and upserts the results into Supabase so the Lovable dashboard
+can read them instead of relying on manual entry.
 
 Run daily via GitHub Actions (see data-processing-sync.yml).
+
+--- REDEFINED 2026-10-07: binary per-file SLA pass/fail retired ---
+Pia flagged that "sent within 7 business days" reads, on its face, as
+"actual sent vs. available" - not as a per-file stopwatch that can make
+a file "miss" independently of every other file. The old rate_pct /
+sent_within_7bd pair *did* use a per-file clock (confirmed deliberately
+on 2026-09-22 - see git history / prior docstring), but that per-file
+framing was the actual source of confusion, not a misunderstanding of
+it. Replaced with two metrics that don't make an individual pass/fail
+claim at all:
+
+  METRIC 1 - eligible_and_sent: a plain completion count. Of the files
+  that are ELIGIBLE (see below, unchanged), how many have simply been
+  marked Results Sent = Yes - no timing check on any individual file.
+  Shown against eligible_files as a completion rate.
+
+  METRIC 2 - avg_processing_days: the mean business-day gap between
+  Upload Date and Send Date, across eligible-and-sent files only.
+  Trend-only, descriptive - explicitly NOT a pass/fail test, and not
+  tied to any goal/target in this script. Confirmed with Pia: this will
+  get more precise once the new billing UI tracks "data became
+  available" directly rather than inferring it from Upload Date.
+
+rate_pct and sent_within_7bd (the old binary count and its percentage)
+are RETIRED going forward: this script no longer computes or writes
+them for current/closed-month rows (written explicitly as null so nothing
+stale lingers looking current). Already-locked historical rows that used
+the old definition are NOT recomputed or touched - by explicit decision,
+not oversight. If older reporting needs the old-definition numbers, they
+remain exactly as originally locked.
+
+total_files_sent is unchanged - still every row in the billing period
+with Results Sent = Yes, regardless of eligibility, and still refreshed
+forever (see point 5 further down) since this is explicitly meant to be
+trackable past the 7-day window, not an SLA-scoped number.
 
 --- Design notes / assumptions (confirm these match reality before trusting numbers) ---
 1. "Eligible files" (confirmed with Pia 2026-09-22) = rows where Data
    Uploaded is Yes/TRUE AND the Upload Date is on or before the
    eligibility cutoff: business day 7 of the PROCESSING month (see
    processing_deadline()). A file that wasn't there by then can't be
-   held to the metric.
-2. "Sent within 7 business days" (sent_within_7bd) = eligible rows where
-   Results Sent is Yes AND the Send Date is no more than 7 business days
-   after THAT file's own Upload Date - unchanged per-file clock. See
-   evaluate_row_sla(), the single shared definition. Business days = Mon-Fri, EXCLUDING the 11 standard
-   US federal holidays (observed dates) AND Curacity's own closures (day
-   after Thanksgiving, weekday Christmas Eve) - see federal_holidays(),
-   curacity_closures() and business_days_elapsed(). The holiday list is computed in-code, not
-   pulled from the `holidays` pip package.
-3. "Total files sent" = count of rows in that billing period where the
-   Results Sent flag is Yes/TRUE, regardless of how long it took. This is
-   a deliberately different, ONGOING metric from "sent within 7 days" -
-   confirmed directly, not a bug: it keeps climbing all month as backlog
-   clears, even after that billing period's SLA window (point 5) has
-   locked. See point 5 and patch_total_files_sent() for how it stays live
-   independently of the frozen SLA fields.
-4. Column names have drifted across tabs over the years, so columns are
+   held to the metric. Unchanged by the Oct 2026 redefinition above.
+2. "eligible_and_sent" (Metric 1, see Oct 2026 note above) = eligible
+   rows where Results Sent is Yes. No timing component at all.
+3. "avg_processing_days" (Metric 2, see Oct 2026 note above) = mean of
+   business_days_elapsed(upload_date, send_date) across rows that are
+   both eligible and sent. Business days = Mon-Fri, EXCLUDING the 11
+   standard US federal holidays (observed dates) AND Curacity's own
+   closures (day after Thanksgiving, weekday Christmas Eve) - see
+   federal_holidays(), curacity_closures() and business_days_elapsed().
+   The holiday list is computed in-code, not pulled from the `holidays`
+   pip package.
+4. "Total files sent" = count of rows in that billing period where the
+   Results Sent flag is Yes/TRUE, regardless of how long it took or
+   whether the row was ever eligible. A deliberately different, ONGOING
+   metric from eligible_and_sent - confirmed directly, not a bug: it
+   keeps climbing all month as backlog clears, even after that billing
+   period's eligible_and_sent (point 5) has locked. See point 5 and
+   patch_live_metrics() for how it stays live independently of the
+   frozen eligibility-scoped fields.
+5. Column names have drifted across tabs over the years, so columns are
    matched by ALIAS, not fixed position. If a future tab renames a column
    again, add the new name to COLUMN_ALIASES below rather than touching the
    parsing logic.
-5. Locking: eligible_files/sent_within_7bd/rate_pct/status lock together,
+6. Locking: eligible_files/eligible_and_sent/status lock together,
    permanently, the moment sla_window_closed() says a billing period's
-   7-business-day window has closed for every possible row in it (see
-   point 6 and the FIXED note below for why this is NOT simply "once the
-   calendar rolls to next month"). Once locked, those four fields are
-   never silently overwritten again, even if the underlying sheet is
-   edited later - this protects numbers that have already been reported
-   out. total_files_sent is the one exception: it keeps being refreshed
-   on every run via a narrow PATCH (patch_total_files_sent()), forever,
-   because it's an intentionally ongoing count, not a frozen SLA outcome.
-   To force a full recompute of an already-locked month (overriding the
-   freeze on all four fields, not just total_files_sent), pass its
-   REPORTING label (e.g. '2026-08') as a CLI arg, or delete its row from
-   the Supabase table.
-6. Billing period vs. reporting label: the tab this reads is named for
+   window has closed for every possible row in it (see point 7 and the
+   FIXED note below for why this is NOT simply "once the calendar rolls
+   to next month"). Once locked, those three fields are never silently
+   overwritten again, even if the underlying sheet is edited later -
+   this protects numbers that have already been reported out.
+   total_files_sent and avg_processing_days are the two exceptions: both
+   keep being refreshed on every run via a narrow PATCH
+   (patch_live_metrics()), forever, because both are intentionally
+   ongoing/descriptive rather than frozen reported outcomes. Note the
+   Oct 2026 redefinition changes WHY eligible_and_sent locking matters
+   (see that note) even though WHEN it locks is unchanged (same
+   sla_window_closed() timing as before - revisit if that no longer
+   makes sense now that there's no per-file clock backing it). To force
+   a full recompute of an already-locked month (overriding the freeze on
+   all three fields, not just the live ones), pass its REPORTING label
+   (e.g. '2026-08') as a CLI arg, or delete its row from the Supabase
+   table.
+7. Billing period vs. reporting label: the tab this reads is named for
    its billing period (July's billing period tab has rows dated
    '7.1.26 - 7.31.26'), but the actual WORK of processing that billing
    period happens the following month (July's invoices are processed in
@@ -70,58 +113,44 @@ unambiguous, but it changes no actual behavior here.
 Previously a billing period stayed status='current' for the entire
 calendar month it was being actively worked in (via MONTH_OFFSET), and
 only locked once the calendar rolled to the NEXT month. But the actual
-7-business-day SLA window for a billing period closes much earlier than
-that: the latest possible Upload Date in, say, July is July 31, and 7
-business days after that is around August 10 - yet the old logic kept
-July's report recomputing and overwriting rate_pct/total_files_sent for
-three more weeks after that, purely because the calendar hadn't rolled
-into September. That's what produced a "closed" month's SLA % silently
-drifting (91.4% -> 90.8%) with no code bug and no duplicate rows involved
-- just real invoices continuing to work through the backlog after the
-window had already functionally closed.
+eligibility window for a billing period closes much earlier than that -
+see processing_deadline(). Fix: sla_window_closed() computes, per
+billing period, the actual date by which every possible row in it must
+have resolved, using the same business_days_elapsed() helper already
+used elsewhere. A billing period locks as soon as that date has passed,
+regardless of which calendar month we're in. This replaces the old
+current_billing_period/MONTH_OFFSET-based lock decision entirely -
+MONTH_OFFSET/month_key_n_back is still used to build the list of billing
+periods to scan, just not to decide locking.
 
-Fix: sla_window_closed() computes, per billing period, the actual date
-by which every possible row in it must have resolved (originally period
-end + 7 business days; since 2026-09-22, the fixed business-day-7
-deadline - see processing_deadline()), using the same business_days_elapsed() helper already
-used for the row-level SLA math. A billing period locks as soon as that
-date has passed, regardless of which calendar month we're in. This
-replaces the old current_billing_period/MONTH_OFFSET-based lock
-decision entirely - MONTH_OFFSET/month_key_n_back is still used to
-build the list of billing periods to scan, just not to decide locking.
-
---- Locking eligible_files/sent_within_7bd/rate_pct is NOT the same as
-locking the whole row ---
-A first pass at this fix locked total_files_sent along with the SLA
-trio, on the theory that "once locked, nothing on this row should
-change." That's wrong for total_files_sent specifically - confirmed
-directly, it's meant to be a running "invoices sent this billing period"
-count that keeps growing indefinitely, independent of the SLA
-determination. So once a month locks: upsert_month() (full row write) is
-never called for it again; instead patch_total_files_sent() runs on
-every subsequent execution, touching only total_files_sent and
-updated_at. status, eligible_files, sent_within_7bd, and rate_pct are
-frozen forever at whatever they were the moment the window closed.
+--- Locking eligible_files/eligible_and_sent is NOT the same as locking
+the whole row ---
+total_files_sent and avg_processing_days are both meant to keep moving
+indefinitely, independent of the eligibility-scoped determination. So
+once a month locks: upsert_month() (full row write) is never called for
+it again; instead patch_live_metrics() runs on every subsequent
+execution, touching only total_files_sent, avg_processing_days, and
+updated_at. status, eligible_files, and eligible_and_sent are frozen
+forever at whatever they were the moment the window closed.
 
 --- CORRECTED: total_files_sent's grouping key ---
-A second pass at this fix grouped total_files_sent by the CALENDAR MONTH
-of each row's own Send Date, scanning every billing-period tab in the
-24-month backfill window looking for matching dates - built on the
-assumption that a late invoice might get its Send Date filled in on an
-OLD tab after a newer one already exists. Confirmed directly - that
-never happens on this sheet. Older tabs are frozen the moment a new one
-is created; an invoice that wasn't sent while its tab was current does
-NOT get updated retroactively - the billing period itself simply shifts
-forward for that hotel instead (it becomes a fresh row in the new tab,
-not an update to the old one). So there is no cross-tab "late send" to
-find, and scanning for one only undercounted against what a single-tab
-count would show. total_files_sent is now grouped the SAME way as
-eligible_files/sent_within_sla: by billing period (see
-extract_month_aggregates()), computed in the one worksheet scan.
+total_files_sent is grouped by BILLING PERIOD (i.e. whichever tab that
+period's rows live in) - NOT by the calendar month of each row's own
+Send Date. An earlier version grouped it by Send Date instead, built on
+a wrong assumption that a late invoice might get its Send Date filled in
+on an OLD tab after a newer one already exists. Confirmed directly -
+that never happens on this sheet. Older tabs are frozen the moment a new
+one is created; an invoice that wasn't sent while its tab was current
+does NOT get updated retroactively - the billing period itself simply
+shifts forward for that hotel instead (it becomes a fresh row in the new
+tab, not an update to the old one). So there is no cross-tab "late send"
+to find, and scanning for one only undercounted against what a
+single-tab count would show.
 """
 
 import os
 import re
+import sys
 import json
 import time
 import calendar
@@ -155,7 +184,8 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]  # raw J
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 TRAILING_MONTHS = 24  # how far back to backfill/consider for the trend line
-BUSINESS_DAY_SLA = 7
+BUSINESS_DAY_SLA = 7  # still used for the eligibility cutoff and lock timing -
+                      # no longer used as a per-file pass/fail threshold
 MONTH_OFFSET = 1  # the actively-worked tab is always the PREVIOUS calendar
                   # month, not the current one - confirmed with the team.
                   # e.g. in late July, the live/active tab is still June's.
@@ -219,9 +249,7 @@ def parse_date(value, reference_year, reference_month=None):
     no-year date whose month is more than 6 months BEFORE the billing
     month is placed in the NEXT year. A December billing period is
     processed in January, so '1/5' on a December tab means Jan 5 of the
-    following year, not 11 months before the period started. Under the
-    fixed business-day-7 window this matters: the wrong year would make
-    a January send look like it happened before the deadline.
+    following year, not 11 months before the period started.
     """
     if not value or not str(value).strip():
         return None
@@ -250,12 +278,9 @@ def parse_billing_period(value):
     """'6.1.26 - 6.30.26' -> (month_key='2026-06', year=2026).
 
     Buckets by the SECOND date in the cell (the end of a '{start} - {end}'
-    range), positionally - same rule as sync_yellow_rows_to_asana.py's
-    parse_billing_period(). A multi-month range like '6.1.26 - 7.31.26'
-    belongs to July, not June. This previously used re.search(), which
-    only ever returned the FIRST date, so every multi-month row was
-    bucketed into its start month and dropped from its real month's
-    counts. Falls back to the only date present if there's just one."""
+    range), positionally. A multi-month range like '6.1.26 - 7.31.26'
+    belongs to July, not June. Falls back to the only date present if
+    there's just one."""
     if not value:
         return None
     matches = re.findall(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", value)
@@ -294,12 +319,9 @@ def resolve_billing_period(raw_period, hotel_name, tab_title):
 
     Normal path: parse the row's own Billing Period Analyzed cell.
     Fallback: ONLY when that cell is completely BLANK and the row has a
-    hotel name, use the tab title's month. Confirmed real case: 8 hotels
-    on 'July 2026 - Media Brands' with a blank period cell were being
-    silently dropped from every count. A cell that's filled in but
+    hotel name, use the tab title's month. A cell that's filled in but
     unparseable is NOT inferred - that's a data error to fix, not guess
-    around. Temporary by design: this pipeline moves to the new billing
-    sheet, which has no free-text period column, after launch.
+    around.
 
     inferred=True lets callers log every row that used the fallback, so
     it stays auditable rather than silent."""
@@ -336,9 +358,8 @@ def _observed(holiday_date):
     falls on a Saturday, federal offices observe it the preceding
     Friday; if it falls on a Sunday, the following Monday. Only applies
     to fixed-date holidays (New Year's, Juneteenth, Independence Day,
-    Veterans Day, Christmas) - the floating ones (MLK Day, Presidents'
-    Day, Memorial Day, Labor Day, Columbus Day, Thanksgiving) are
-    already defined as a specific weekday and never need shifting."""
+    Veterans Day, Christmas) - the floating ones are already defined as
+    a specific weekday and never need shifting."""
     if holiday_date.weekday() == 5:  # Saturday
         return holiday_date - dt.timedelta(days=1)
     if holiday_date.weekday() == 6:  # Sunday
@@ -351,11 +372,8 @@ _FEDERAL_HOLIDAY_CACHE = {}
 
 def federal_holidays(year):
     """The 11 standard US federal holidays for a given calendar year,
-    with observed-date shifting applied to the fixed-date ones. This is
-    the STANDARD OPM list only - no Curacity-specific additions (a
-    shutdown week, day-after-Thanksgiving, etc.). If any should be
-    layered on top, add them here explicitly with a comment explaining
-    why, rather than folding them silently into this list."""
+    with observed-date shifting applied to the fixed-date ones. Standard
+    OPM list only - no Curacity-specific additions."""
     if year not in _FEDERAL_HOLIDAY_CACHE:
         _FEDERAL_HOLIDAY_CACHE[year] = {
             _observed(dt.date(year, 1, 1)),         # New Year's Day
@@ -378,16 +396,9 @@ _CURACITY_CLOSURE_CACHE = {}
 
 def curacity_closures(year):
     """Curacity-specific business closures, layered ON TOP of the
-    standard federal list (kept separate on purpose, so the federal list
-    stays exactly the OPM calendar). Confirmed with Pia, 2026-09-22:
-
+    standard federal list:
       - Day after Thanksgiving (always a Friday).
-      - Christmas Eve, Dec 24 - only when it falls on a weekday. No
-        observed-date shifting: a Saturday/Sunday Christmas Eve adds no
-        extra closure day. (When Christmas itself is on a Saturday, its
-        federal observed date is Fri Dec 24 anyway, so the two coincide.)
-
-    Add any future company closures here, one line each with a comment."""
+      - Christmas Eve, Dec 24 - only when it falls on a weekday."""
     if year not in _CURACITY_CLOSURE_CACHE:
         closures = {
             _nth_weekday_of_month(year, 11, 3, 4) + dt.timedelta(days=1),  # Day after Thanksgiving
@@ -412,24 +423,13 @@ def _holidays_spanning(start_date, end_date):
 def business_days_elapsed(start_date, end_date):
     """Count weekday-only business days strictly after start_date through
     end_date inclusive, EXCLUDING the 11 standard US federal holidays
-    plus Curacity's own closures (see federal_holidays() and
-    curacity_closures()). Returns None if inputs are missing or out
-    of order.
+    plus Curacity's own closures. Returns None if inputs are missing or
+    out of order.
 
-    This is used both for the row-level "was this sent within 7 business
-    days" check AND for sla_window_closed()'s lock-timing calculation -
-    a holiday within either date range now correctly adds a day, in both
-    places, since they share this one implementation.
-
-    IMPORTANT: this changes results for ANY date range that spans a
-    federal holiday, compared to the weekends-only version this replaced.
-    A month already frozen (status='closed') is NOT retroactively
-    recomputed by this change - it stays exactly as reported, by design.
-    If a recently-locked month's window overlapped a holiday under the
-    OLD weekends-only logic, its frozen numbers were computed with an
-    incomplete business-day definition; force-recompute it via the CLI
-    month-key argument if that materially affected it - see the module
-    docstring's locking section for how."""
+    Used for: (a) processing_deadline()/sla_window_closed()'s cutoff and
+    lock-timing math, and (b) per-row elapsed time feeding
+    avg_processing_days (Metric 2) - purely descriptive there now, not a
+    pass/fail test."""
     if start_date is None or end_date is None:
         return None
     if end_date < start_date:
@@ -460,10 +460,11 @@ def nth_business_day(year, month, n):
 
 
 def processing_deadline(billing_period):
-    """The SLA deadline for a billing period: business day
+    """The ELIGIBILITY deadline for a billing period: business day
     BUSINESS_DAY_SLA of the PROCESSING month (the month after the billing
     period - July's billing period is processed in August). e.g.
-    '2026-07' -> Tue 2026-08-11."""
+    '2026-07' -> Tue 2026-08-11. Unchanged by the Oct 2026 metric
+    redefinition - this still gates what counts as "eligible" at all."""
     year, month = (int(x) for x in shift_month_key(billing_period, 1).split("-"))
     return nth_business_day(year, month, BUSINESS_DAY_SLA)
 
@@ -481,53 +482,65 @@ def add_business_days(start_date, n):
 
 
 def evaluate_row_sla(billing_period, uploaded_flag, upload_date, sent_flag, send_date):
-    """The ONE place eligibility and SLA outcome are decided, shared by
-    the real sync and --list-rows so they can never disagree.
+    """The ONE place eligibility and the two throughput metrics are
+    computed for a single row, shared by the real sync and --list-rows
+    so they can never disagree.
 
-    Confirmed with Pia 2026-09-22 - ONLY eligibility changed; the
-    on-time test is the same per-file clock as always:
-      eligible = Data Uploaded = Yes AND Upload Date on or before the
-                 eligibility cutoff (business day 7 of the processing
-                 month - see processing_deadline()). A file that wasn't
-                 there by then can't be held to the metric. It still
-                 counts toward total_files_sent once sent.
-      met      = eligible AND Results Sent = Yes AND Send Date no more
-                 than BUSINESS_DAY_SLA business days after THAT file's
-                 own Upload Date (holiday/closure-aware).
-    So met under this rule = met under the old rule, minus only files
-    uploaded after the cutoff (they leave numerator AND denominator).
-    Returns (eligible, met, cutoff, elapsed_business_days)."""
+    REDEFINED 2026-10-07 (see module docstring's "REDEFINED" section):
+      eligible          = Data Uploaded = Yes AND Upload Date on or
+                           before the eligibility cutoff (business day 7
+                           of the processing month). Unchanged.
+      eligible_and_sent = eligible AND Results Sent = Yes. NO timing
+                           check - this is Metric 1's per-row unit.
+      elapsed           = business days from Upload Date to Send Date,
+                           computed ONLY when eligible_and_sent is true.
+                           Feeds Metric 2 (avg_processing_days) as a
+                           trend input, never as a pass/fail gate.
+
+    Returns (eligible, eligible_and_sent, cutoff, elapsed_business_days).
+    elapsed is None whenever eligible_and_sent is False (nothing to
+    measure yet), or when send_date is missing/unparseable despite the
+    sent flag being set."""
     cutoff = processing_deadline(billing_period)
     eligible = bool(uploaded_flag and upload_date is not None and upload_date <= cutoff)
-    elapsed = business_days_elapsed(upload_date, send_date) if (upload_date and send_date) else None
-    met = bool(eligible and sent_flag and elapsed is not None and elapsed <= BUSINESS_DAY_SLA)
-    return eligible, met, cutoff, elapsed
+    eligible_and_sent = bool(eligible and sent_flag)
+    elapsed = None
+    if eligible_and_sent and upload_date and send_date:
+        elapsed = business_days_elapsed(upload_date, send_date)
+    return eligible, eligible_and_sent, cutoff, elapsed
 
 
 def sla_window_closed(billing_period, today=None):
-    """True once no eligible row in this billing period can still change
-    outcome: the day after (eligibility cutoff + BUSINESS_DAY_SLA
-    business days). For July 2026's billing period: cutoff Tue 8/11,
-    last on-time send Thu 8/20, locks Fri 8/21. (Updated 2026-09-22 -
-    previously period end + 7 business days, which was too early once
-    files uploaded during the processing month's first week became
-    eligible with their own 7-day clocks still running.)"""
+    """True once the eligible_files/eligible_and_sent pool for this
+    billing period is treated as final and ready to lock: the day after
+    (eligibility cutoff + BUSINESS_DAY_SLA business days).
+
+    NOTE (Oct 2026): this timing is UNCHANGED from before the metric
+    redefinition, but its justification has changed. It used to mark the
+    point at which every individual file's personal 7-day pass/fail
+    clock had necessarily expired. Now that eligible_and_sent has no
+    per-file clock, this date instead marks "a reasonable grace period
+    past the eligibility cutoff, after which we freeze the reported
+    completion count for this period" - a policy choice carried forward
+    unchanged rather than re-derived. Revisit this window length if it
+    no longer reflects actual processing turnaround."""
     if today is None:
         today = dt.date.today()
-    # The latest ELIGIBLE upload is on the cutoff (business day 7 of the
-    # processing month); its own 7-business-day clock ends 7 business
-    # days after that. Lock the day after, so a send on that last day is
-    # still captured. Before then some eligible row could still pass.
-    last_possible_on_time_send = add_business_days(processing_deadline(billing_period), BUSINESS_DAY_SLA)
-    return today > last_possible_on_time_send
+    last_possible_grace_date = add_business_days(processing_deadline(billing_period), BUSINESS_DAY_SLA)
+    return today > last_possible_grace_date
 
 
 @dataclass
 class MonthAgg:
     eligible_files: int = 0
-    sent_within_sla: int = 0
+    eligible_and_sent: int = 0
     total_files_sent: int = 0
     rows_seen: int = 0
+    elapsed_days: list = field(default_factory=list)  # business days elapsed,
+                                                        # eligible-and-sent rows
+                                                        # only - feeds the
+                                                        # avg_processing_days
+                                                        # trend metric
 
 
 # ---------------------------------------------------------------------------
@@ -543,9 +556,7 @@ def get_gspread_client():
 
 def get_all_values_with_retry(ws):
     """Reads a worksheet's values, retrying with backoff on rate-limit
-    errors instead of silently giving up. This is the fix for a real
-    incident where a plain try/except swallowed 429s across ~40 tabs and
-    only one tab's data ever made it into Supabase."""
+    errors instead of silently giving up."""
     for attempt in range(SHEETS_MAX_RETRIES):
         try:
             values = ws.get_all_values()
@@ -565,46 +576,30 @@ def get_all_values_with_retry(ws):
 
 
 def relevant_worksheets(spreadsheet, cutoff_month_key):
-    """Returns worksheets worth scanning: anything whose title looks like a
-    month/year tab, without assuming an exact naming scheme (tab-naming has
-    drifted over the years). We filter by content (Billing Period column),
-    not by tab title, so this is robust to that drift."""
+    """Returns worksheets worth scanning. We filter by content (Billing
+    Period column), not by tab title, so this is robust to tab-naming
+    drift."""
     return spreadsheet.worksheets()
 
 
 def extract_month_aggregates(spreadsheet, billing_periods_wanted):
     """Scans all worksheets once, bucketing rows into MonthAgg by their
-    actual Billing Period Analyzed value (not by tab name) - a single
-    tab occasionally contains rows spanning more than one billing
-    period, though in practice each tab represents one period, and
-    older tabs are never touched again once a new one is created.
-    Returns {billing_period_month_key: MonthAgg}.
+    actual Billing Period Analyzed value (not by tab name). Returns
+    {billing_period_month_key: MonthAgg}.
 
-    CORRECTED: total_files_sent is grouped the SAME way as
-    eligible_files/sent_within_sla - by billing period (i.e. whichever
-    tab that period's rows live in) - NOT by the calendar month of each
-    row's own Send Date. An earlier version grouped total_files_sent by
-    Send Date instead, scanning across every tab in the 24-month window
-    looking for matching dates. That was built on a wrong assumption:
-    that an invoice which missed being sent while its tab was current
-    might get its Send Date filled in LATER, on that now-old tab, after
-    a newer tab already exists. Confirmed directly - that never happens.
-    Older tabs are frozen the moment a new one is created; an invoice
-    that wasn't sent in time doesn't get chased down retroactively in
-    its original tab, the billing period itself simply shifts forward
-    for that hotel instead. So there is no cross-tab "late send" to find
-    - scanning every tab for it only under-served the real (single-tab)
-    count and needlessly re-read 40+ tabs' worth of already-frozen data.
+    total_files_sent is grouped the SAME way as eligible_files/
+    eligible_and_sent - by billing period (i.e. whichever tab that
+    period's rows live in) - NOT by the calendar month of each row's own
+    Send Date (see module docstring's "CORRECTED" section for why).
 
     Reference year for parsing no-year date values (both Upload Date and
     Send Date) always comes from the row's own Billing Period Analyzed
-    cell - neither date field is assumed to carry a year on its own."""
+    cell."""
     aggs = {mk: MonthAgg() for mk in billing_periods_wanted}
 
     def _cell(row, idx):
         """Safe column access. A row can be legitimately shorter than
-        the header row (trailing blank cells get dropped by
-        get_all_values()) without any of its actually-populated columns
+        the header row without any of its actually-populated columns
         being invalid - returns '' for a missing/out-of-range column
         instead of the caller having to skip the whole row."""
         if idx is None or idx >= len(row):
@@ -633,7 +628,7 @@ def extract_month_aggregates(spreadsheet, billing_periods_wanted):
         # skipped here.
         if col_period is None:
             continue
-        # Beyond that, eligible_files/sent_within_sla and
+        # Beyond that, eligible_files/eligible_and_sent and
         # total_files_sent have INDEPENDENT minimum requirements: a tab
         # missing Upload Date can still contribute a Results-Sent count,
         # and a tab missing a Sent flag/Send Date can still contribute
@@ -665,13 +660,15 @@ def extract_month_aggregates(spreadsheet, billing_periods_wanted):
             sent_flag = is_truthy(_cell(row, col_sent_flag)) if col_sent_flag is not None else bool(_cell(row, col_send_date))
             send_date = parse_date(_cell(row, col_send_date), year, ref_month)
 
-            eligible, met, _cutoff, _elapsed = evaluate_row_sla(
+            eligible, eligible_and_sent, _cutoff, elapsed = evaluate_row_sla(
                 billing_month_key, uploaded_flag, upload_date, sent_flag, send_date
             )
             if eligible:
                 agg.eligible_files += 1
-            if met:
-                agg.sent_within_sla += 1
+            if eligible_and_sent:
+                agg.eligible_and_sent += 1
+                if elapsed is not None:
+                    agg.elapsed_days.append(elapsed)
 
             if sent_flag:
                 agg.total_files_sent += 1
@@ -681,6 +678,12 @@ def extract_month_aggregates(spreadsheet, billing_periods_wanted):
                   f"used the tab title's month instead (see resolve_billing_period).")
 
     return aggs
+
+
+def _avg(elapsed_days):
+    if not elapsed_days:
+        return None
+    return round(sum(elapsed_days) / len(elapsed_days), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -706,27 +709,29 @@ def fetch_existing_month_keys(status_filter=None):
     return {r["month_key"] for r in rows}
 
 
-def upsert_month(month_key, agg, total_files_sent, status, dry_run=False):
+def upsert_month(month_key, agg, total_files_sent, avg_processing_days, status, dry_run=False):
     """Full-row write. Only ever called for a month that is NOT yet
-    SLA-locked (status='current') or the very first time a month
-    transitions to 'closed' - both of those are legitimate moments to
-    write everything at once. Never called again for an already-locked
-    month; see patch_total_files_sent() for what happens to those.
+    locked (status='current') or the very first time a month transitions
+    to 'closed' - both legitimate moments to write everything at once.
+    Never called again for an already-locked month; see
+    patch_live_metrics() for what happens to those.
 
-    total_files_sent is passed in explicitly as its own parameter (even
-    though callers currently always pass agg.total_files_sent) so this
-    function's signature doesn't quietly assume where that number came
-    from.
+    rate_pct and sent_within_7bd are explicitly written as null here -
+    they are RETIRED (see module docstring's "REDEFINED" section) and
+    this script no longer computes them for current/closed-month rows.
+    Already-locked historical rows that still hold the old values are
+    NOT touched by this function, since it's never called for them again.
 
     dry_run=True prints the payload that WOULD be written and returns
     without making any Supabase call at all."""
-    rate = (agg.sent_within_sla / agg.eligible_files * 100) if agg.eligible_files else None
     payload = {
         "month_key": month_key,
         "eligible_files": agg.eligible_files,
-        "sent_within_7bd": agg.sent_within_sla,
-        "rate_pct": round(rate, 1) if rate is not None else None,
+        "eligible_and_sent": agg.eligible_and_sent,
+        "sent_within_7bd": None,   # retired - see module docstring
+        "rate_pct": None,          # retired - see module docstring
         "total_files_sent": total_files_sent,
+        "avg_processing_days": avg_processing_days,
         "status": status,
         "updated_at": dt.datetime.utcnow().isoformat(),
     }
@@ -734,9 +739,7 @@ def upsert_month(month_key, agg, total_files_sent, status, dry_run=False):
         print(f"[DRY RUN] Would upsert {month_key} ({status}): {payload}")
         return
     # on_conflict=month_key: month_key is confirmed to be the table's
-    # actual primary key (checked directly via pg_get_constraintdef), so
-    # this is just making that explicit rather than fixing a real bug -
-    # an earlier duplicate-row theory here was investigated and ruled out.
+    # actual primary key (checked directly via pg_get_constraintdef).
     url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?on_conflict=month_key"
     resp = requests.post(
         url,
@@ -748,49 +751,49 @@ def upsert_month(month_key, agg, total_files_sent, status, dry_run=False):
     print(f"Upserted {month_key} ({status}): {payload}")
 
 
-def patch_total_files_sent(month_key, total_files_sent, dry_run=False):
-    """total_files_sent is a genuinely different metric from the SLA
-    trio (eligible_files/sent_within_7bd/rate_pct): "how many invoices in
-    THIS billing period's tab have Results Sent = Yes, right now" - a
-    running count that keeps climbing as long as that tab is still being
-    worked, independent of whether the SLA determination for the same
-    period has already locked. Confirmed directly - this is not a bug to
-    fix, it's the intended design.
+def patch_live_metrics(month_key, total_files_sent, avg_processing_days, dry_run=False):
+    """total_files_sent and avg_processing_days are the two metrics that
+    keep moving indefinitely regardless of whether this month's
+    eligibility-scoped fields (eligible_files/eligible_and_sent/status)
+    have already locked. Confirmed directly for both: total_files_sent
+    is meant to be trackable past the 7-day window, and avg_processing_days
+    is explicitly trend-only with no freeze point.
 
-    Once a month is SLA-locked, this is the ONLY field that should keep
-    updating on its row. A full upsert_month() call here would also
-    recompute and overwrite eligible_files/sent_within_7bd/rate_pct with
-    a fresh value from today's sheet read - which might genuinely differ
-    from what was locked in (e.g. a hotel backdating an upload weeks
-    late) and would silently un-freeze exactly what sla_window_closed()
-    exists to protect. This does a narrow PATCH touching only
-    total_files_sent and updated_at, leaving status and the three SLA
-    columns exactly as they were the moment this month locked.
+    Once a month is locked, this is the ONLY function that should touch
+    its row. A full upsert_month() call here would also recompute and
+    overwrite eligible_files/eligible_and_sent/status with a fresh value
+    from today's sheet read - which might genuinely differ from what was
+    locked in (e.g. a hotel backdating an upload weeks late) and would
+    silently un-freeze exactly what sla_window_closed() exists to
+    protect. This does a narrow PATCH touching only total_files_sent,
+    avg_processing_days, and updated_at, leaving status and the two
+    eligibility fields exactly as they were the moment this month locked.
 
-    dry_run=True prints what WOULD be patched and returns without
-    making any Supabase call at all."""
+    dry_run=True prints what WOULD be patched and returns without making
+    any Supabase call at all."""
     if dry_run:
-        print(f"[DRY RUN] Would patch total_files_sent for locked month {month_key}: {total_files_sent}")
+        print(f"[DRY RUN] Would patch locked month {month_key}: "
+              f"total_files_sent={total_files_sent}, avg_processing_days={avg_processing_days}")
         return
     url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?month_key=eq.{month_key}"
     payload = {
         "total_files_sent": total_files_sent,
+        "avg_processing_days": avg_processing_days,
         "updated_at": dt.datetime.utcnow().isoformat(),
     }
     resp = requests.patch(url, headers=supabase_headers(), json=payload, timeout=30)
     resp.raise_for_status()
-    print(f"Patched total_files_sent for locked month {month_key}: {total_files_sent}")
+    print(f"Patched locked month {month_key}: {payload}")
 
 
 def list_rows_for_billing_period(spreadsheet, billing_period):
     """Diagnostic ONLY - makes no Supabase calls at all, read-only
     against the sheet. Prints every row found (across all worksheets)
     whose Billing Period Analyzed cell matches billing_period, with
-    enough detail to manually verify eligibility/SLA/sent-month
-    determinations by eye against whatever Supabase ends up showing.
-    billing_period is a BILLING PERIOD (e.g. '2026-07'), not a reporting
-    label - August's reporting month is built from July's billing
-    period, so pass '2026-07' to inspect what feeds August's row."""
+    enough detail to manually verify eligibility/eligible-and-sent/
+    avg-processing-days determinations by eye against whatever Supabase
+    ends up showing. billing_period is a BILLING PERIOD (e.g. '2026-07'),
+    not a reporting label."""
 
     def _cell(row, idx):
         if idx is None or idx >= len(row):
@@ -799,15 +802,12 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
 
     found = 0
     inferred_total = 0
-    # Breakdown of every ELIGIBLE row that did NOT meet the deadline, by
-    # reason - so a low rate_pct can be traced to specific rows instead
-    # of guessed at. Keys are reason labels, values are [hotel, ...].
-    miss_reasons = {}
-    removed_by_cutoff = []  # on time per-file, but uploaded after the cutoff
-    eligible_by_upload_timing = {"before processing month": [0, 0],   # [eligible, met]
-                                 "during window (BD1-BD7)": [0, 0]}
+    not_yet_sent = []  # eligible rows with Results Sent not Yes - replaces the
+                        # old "missed by reason" breakdown, which no longer
+                        # applies since there's no timing-based miss condition
     unparsed_by_tab = {}            # tab title -> [(hotel, raw period)]
     unrecognized_sent_values = {}   # raw Results Sent value -> row count
+    elapsed_days_found = []
 
     for ws in spreadsheet.worksheets():
         try:
@@ -860,74 +860,40 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
             if raw_sent.strip() and not sent_flag and normalize(raw_sent) not in {"no", "n", "false"}:
                 unrecognized_sent_values[raw_sent.strip()] = unrecognized_sent_values.get(raw_sent.strip(), 0) + 1
 
-            eligible, met_sla, deadline, elapsed = evaluate_row_sla(
+            eligible, eligible_and_sent, deadline, elapsed = evaluate_row_sla(
                 parsed_period[0], uploaded_flag, upload_date, sent_flag, send_date
             )
 
-            if (not eligible and uploaded_flag and upload_date is not None and sent_flag
-                    and elapsed is not None and elapsed <= BUSINESS_DAY_SLA):
-                removed_by_cutoff.append(f"{hotel} (upload {upload_date}, send {send_date})")
+            if eligible and not eligible_and_sent:
+                raw_send = _cell(row, col_send_date).strip()
+                not_yet_sent.append(f"{hotel} (upload {upload_date})")
 
-            if eligible:
-                proc_start = dt.date(deadline.year, deadline.month, 1)
-                timing = ("before processing month" if upload_date < proc_start
-                          else "during window (BD1-BD7)")
-                eligible_by_upload_timing[timing][0] += 1
-                if met_sla:
-                    eligible_by_upload_timing[timing][1] += 1
-                else:
-                    raw_send = _cell(row, col_send_date).strip()
-                    if not sent_flag and not raw_send:
-                        reason = "not sent yet (flag not Yes, no Send Date)"
-                    elif not sent_flag:
-                        reason = "Send Date filled but Results Sent flag not Yes"
-                    elif send_date is None and raw_send:
-                        reason = "sent, but Send Date unparseable"
-                    elif send_date is None:
-                        reason = "sent, but Send Date blank"
-                    else:
-                        reason = f"sent more than {BUSINESS_DAY_SLA} business days after upload"
-                    label = (f"{hotel} (upload {upload_date}, send {send_date or repr(raw_send)}, "
-                             f"elapsed {elapsed})")
-                    miss_reasons.setdefault(reason, []).append(label)
+            if elapsed is not None:
+                elapsed_days_found.append(elapsed)
 
             print(
                 f"[{ws.title}] {hotel} | uploaded={uploaded_flag} upload_date={upload_date} | "
                 f"sent={sent_flag} send_date={send_date} | "
                 f"elapsed_business_days={elapsed} | eligibility_cutoff={deadline} | "
-                f"eligible={eligible} met_sla={met_sla} "
+                f"eligible={eligible} eligible_and_sent={eligible_and_sent} "
                 f"| contributes_to_total_files_sent={sent_flag}"
                 + (" | period INFERRED from tab title (cell blank)" if inferred else "")
             )
 
-        # Only report unparseable rows for tabs that actually hold this
-        # billing period - otherwise every old tab's junk would drown it out.
         if tab_matches and unparsed_rows:
             unparsed_by_tab[ws.title] = unparsed_rows
 
     print(f"\n{found} row(s) found for billing period {billing_period} "
           f"({inferred_total} of them via tab-title fallback for a blank period cell).")
 
-    print(f"\nREMOVED BY ELIGIBILITY CUTOFF - {len(removed_by_cutoff)} row(s) uploaded after "
-          f"{processing_deadline(billing_period)} that WERE sent within {BUSINESS_DAY_SLA} business "
-          f"days. These are the ONLY rows the cutoff removes from sent_within_7bd:")
-    for h in removed_by_cutoff:
+    print(f"\nELIGIBLE BUT NOT YET SENT - {len(not_yet_sent)} row(s) "
+          f"(no timing judgment here - just not marked Results Sent = Yes yet):")
+    for h in not_yet_sent:
         print(f"    {h}")
 
-    print(f"\nELIGIBLE BY UPLOAD TIMING (cutoff {processing_deadline(billing_period)}):")
-    for timing, (n_elig, n_met) in eligible_by_upload_timing.items():
-        pct = f"{n_met / n_elig * 100:.1f}%" if n_elig else "n/a"
-        print(f"  {timing}: {n_met}/{n_elig} met ({pct})")
-
-    if miss_reasons:
-        total_missed = sum(len(v) for v in miss_reasons.values())
-        print(f"\nELIGIBLE BUT MISSED - {total_missed} row(s), by reason:")
-        for reason, hotels in sorted(miss_reasons.items(), key=lambda kv: -len(kv[1])):
-            print(f"  {reason}: {len(hotels)}")
-        for reason, hotels in sorted(miss_reasons.items(), key=lambda kv: -len(kv[1])):
-            print(f"\n  -- {reason} --")
-            for h in hotels:
-                print(f"    {h}")
+    avg = _avg(elapsed_days_found)
+    print(f"\nAVG PROCESSING DAYS (eligible-and-sent rows only): "
+          f"{avg if avg is not None else 'n/a'} across {len(elapsed_days_found)} row(s)")
 
     if unparsed_by_tab:
         total_unparsed = sum(len(v) for v in unparsed_by_tab.values())
@@ -952,22 +918,15 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
 
 def audit_columns(spreadsheet):
     """Diagnostic ONLY - no Supabase calls. For every worksheet, prints
-    which of the four columns this script depends on (billing_period,
-    upload_date, results_sent_flag, send_date) were actually recognized
-    via COLUMN_ALIASES, and - for any tab missing one - the tab's raw
-    header row.
+    which of the four columns this script depends on were actually
+    recognized via COLUMN_ALIASES, and - for any tab missing one - the
+    tab's raw header row.
 
     A tab whose Send Date or Results Sent column uses a header variant
     NOT in COLUMN_ALIASES silently contributes ZERO rows to
-    total_files_sent (and to eligible_files/sent_within_sla too, if it's
-    Upload Date or Billing Period that's unrecognized) - with no error,
-    no warning, nothing. This is the single most likely explanation for
-    a live count coming in lower than a manually-verified true count:
-    the sheet's own column names have drifted across tabs over the
-    years (see the module docstring), and COLUMN_ALIASES has to be
-    updated by hand whenever that happens. Run this whenever a count
-    looks short and check every "MISSING" line's raw headers against
-    COLUMN_ALIASES to find the drifted name, then add it there."""
+    total_files_sent (and to eligible_files/eligible_and_sent too, if
+    it's Upload Date or Billing Period that's unrecognized) - with no
+    error, no warning, nothing. Run this whenever a count looks short."""
     total_missing_tabs = 0
     for ws in spreadsheet.worksheets():
         try:
@@ -1025,9 +984,7 @@ def shift_month_key(month_key, n):
     """Shifts a 'YYYY-MM' key forward (or back, if n is negative) by n
     months. Used to convert a BILLING PERIOD (which tab/period was read
     from the sheet) into a REPORTING label (which month's throughput this
-    counts toward on the dashboard) - these are deliberately different:
-    July's billing period is processed in August, so July's billing-
-    period data should be labeled and displayed as August's result."""
+    counts toward on the dashboard)."""
     year, month = (int(x) for x in month_key.split("-"))
     total = year * 12 + (month - 1) + n
     year, month = divmod(total, 12)
@@ -1043,8 +1000,7 @@ def main(force_months=None, dry_run=False, list_rows_billing_period=None, audit=
 
     if list_rows_billing_period:
         # Diagnostic mode overrides everything else - read-only, no
-        # Supabase calls, exits after printing. Matches the workflow's
-        # own description: "Overrides dry_run/force_month when set."
+        # Supabase calls, exits after printing.
         gc = get_gspread_client()
         spreadsheet = gc.open_by_key(SHEET_ID)
         list_rows_for_billing_period(spreadsheet, list_rows_billing_period)
@@ -1065,28 +1021,21 @@ def main(force_months=None, dry_run=False, list_rows_billing_period=None, audit=
         if agg is None or agg.rows_seen == 0:
             continue  # no data found for this billing period in the sheet yet/anymore
 
-        # The billing period itself is correct as read - only the LABEL
-        # this gets stored/displayed under shifts forward one month.
-        # Processing July's billing period happens in August, so this
-        # data is August's throughput number, not July's.
         report_month_key = shift_month_key(billing_period, 1)
+        avg_processing_days = _avg(agg.elapsed_days)
 
         if not sla_window_closed(billing_period):
-            # Window still open for at least some rows in this billing
-            # period - keep recomputing/overwriting daily. Deliberately
-            # NOT tied to current_billing_period/calendar-month rollover
-            # anymore - see sla_window_closed()'s docstring for why.
-            upsert_month(report_month_key, agg, agg.total_files_sent, status="current", dry_run=dry_run)
+            # Window still open - keep recomputing/overwriting daily.
+            upsert_month(report_month_key, agg, agg.total_files_sent, avg_processing_days,
+                         status="current", dry_run=dry_run)
         elif report_month_key in already_closed and report_month_key not in force_months:
-            # SLA-locked: eligible_files/sent_within_7bd/rate_pct/status
-            # must not change again. total_files_sent is still refreshed
-            # on every run - the tab itself is frozen once superseded, so
-            # this naturally stabilizes rather than needing a special
-            # cutoff - via a narrow PATCH rather than a full upsert, so
-            # the frozen SLA fields are never touched again.
-            patch_total_files_sent(report_month_key, agg.total_files_sent, dry_run=dry_run)
+            # Locked: eligible_files/eligible_and_sent/status must not
+            # change again. total_files_sent and avg_processing_days are
+            # still refreshed on every run via a narrow PATCH.
+            patch_live_metrics(report_month_key, agg.total_files_sent, avg_processing_days, dry_run=dry_run)
         else:
-            upsert_month(report_month_key, agg, agg.total_files_sent, status="closed", dry_run=dry_run)
+            upsert_month(report_month_key, agg, agg.total_files_sent, avg_processing_days,
+                         status="closed", dry_run=dry_run)
 
 
 if __name__ == "__main__":
@@ -1099,17 +1048,13 @@ if __name__ == "__main__":
                          help="Force-recompute this already-closed REPORTING month (e.g. 2026-08), "
                               "overriding its freeze. Repeatable: --month 2026-08 --month 2026-01.")
     parser.add_argument("--dry-run", action="store_true",
-                         help="Print what would be written without writing it. Reads (fetching "
-                              "existing month keys, reading the sheet) still happen normally.")
+                         help="Print what would be written without writing it.")
     parser.add_argument("--list-rows", dest="list_rows_billing_period", default=None,
-                         help="Diagnostic only: print every row found for this BILLING PERIOD "
-                              "(e.g. 2026-07 for August's reporting month), then exit. Read-only - "
-                              "makes no Supabase calls. Overrides --dry-run/--month when set.")
+                         help="Diagnostic only: print every row found for this BILLING PERIOD, "
+                              "then exit. Read-only - makes no Supabase calls.")
     parser.add_argument("--audit-columns", action="store_true",
                          help="Diagnostic only: for every worksheet, print which required columns "
-                              "were recognized and the raw header row for any tab missing one, then "
-                              "exit. Read-only - makes no Supabase calls. Run this when a count looks "
-                              "short - a drifted column header on some tab is the most likely cause.")
+                              "were recognized and the raw header row for any tab missing one.")
     args = parser.parse_args()
 
     all_force_months = list(args.force_months) + list(args.positional_months)
