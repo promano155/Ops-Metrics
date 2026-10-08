@@ -12,7 +12,7 @@ unless you are testing, because they need the secrets listed below.
 | Type | How it runs |
 | --- | --- |
 | **GitHub cron** | A `schedule:` block in the workflow file (times are UTC). |
-| **External cron** | The workflow only has `workflow_dispatch`. An outside scheduler (cron-job.org) calls GitHub's API to start it, because GitHub's own scheduler can be late or skip runs. |
+| **External cron** | An outside scheduler (cron-job.org) calls GitHub's API to start the workflow, because GitHub's own scheduler can be late or skip runs. The workflow must have `workflow_dispatch`, and **its file name is part of the URL cron-job.org calls**, so renaming or moving a workflow file breaks that job. |
 | **Manual** | Run it yourself from the **Actions** tab: pick the workflow, click **Run workflow**. |
 
 ## What runs what
@@ -21,9 +21,9 @@ unless you are testing, because they need the secrets listed below.
 
 | Workflow | Script(s) | Trigger | What it does |
 | --- | --- | --- | --- |
-| `Javi_team_sync.yml` | `sync_data_processing_metrics.py`, `sync_hubspot_ticket_metrics.py`, `sync_hubspot_ticket_sla.py`, `sync_yellow_rows_to_asana.py` | GitHub cron, daily 13:00 UTC | Main daily run: data-processing SLA metrics, HubSpot ticket volume and SLA, and flagged billing rows pushed to Asana. |
+| `Javi_team_sync.yml` | `sync_data_processing_metrics.py`, `sync_hubspot_ticket_metrics.py`, `sync_hubspot_ticket_sla.py`, `sync_yellow_rows_to_asana.py` | GitHub cron (daily 13:00 UTC) and external cron (hourly) | Main run: data-processing SLA metrics, HubSpot ticket volume and SLA, and flagged billing rows pushed to Asana. The `skip_yellow_row` input leaves out the Asana step. Takes about 11 minutes. **Do not rename this file:** its name is part of the URL cron-job.org calls. |
 | `scheduled-data-processing-sync.yml` | `sync_data_processing_metrics.py` | External cron | Daily data-processing SLA metrics. Optional `force_month` input recomputes a closed month. |
-| `scheduled-sync-data-issues-to-asana.yml` | `sync_data_issues_to_asana.py` | External cron | Creates Asana tasks for data issues, file errors, and integration issues from the newest month. |
+| `scheduled-sync-data-issues-to-asana.yml` | `sync_data_issues_to_asana.py` | Not currently triggered | Creates Asana tasks for data issues, file errors, and integration issues from the newest month. Used by the Lovable app; its cron-job.org job is disabled. Kept for its logic. |
 | `scheduled-ticket-sla-sync.yml` | `sync_hubspot_ticket_sla.py` | External cron | HubSpot ticket SLA metrics. |
 | `scheduled-reconciliations-sync.yml` | `sync_reconciliations_monthly.py` | External cron | Monthly reconciliation volume (opened, completed, backlog), read from email. |
 | `scheduled-reports-sent-sync.yml` | `sync_reports_sent_monthly.py` | External cron | Monthly count of client reports sent. |
@@ -40,7 +40,8 @@ unless you are testing, because they need the secrets listed below.
 | `manual-reconciliations-sync.yml` | `sync_reconciliations_monthly.py` | Re-run the reconciliation sync on demand. |
 | `manual-reports-sent-sync.yml` | `sync_reports_sent_monthly.py` | Re-run the reports-sent sync on demand. |
 | `manual-sync-data-issues-to-asana.yml` | `sync_data_issues_to_asana.py` | Test the data-issues sync against a specific past month. |
-| `sync-asana-only.yml` | `sync_yellow_rows_to_asana.py` | Push flagged billing rows to Asana without the rest of the daily run. |
+| `cleanup-v1-duplicates.yml` | `cleanup_v1_transition_duplicates.py` | One-time cleanup of duplicate hotel tasks left over from the V1 transition. Runs as a dry run unless `confirm` is ticked. Safe to delete once the cleanup is done. |
+| `sync-asana-only.yml` | `sync_yellow_rows_to_asana.py` | External cron (hourly, weekdays) | Pushes flagged billing rows from the billing sheet to Asana without the rest of the main run. Can also be run by hand. |
 
 ## Settings the workflows depend on
 
