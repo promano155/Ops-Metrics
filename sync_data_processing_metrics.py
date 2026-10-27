@@ -15,20 +15,23 @@ a file "miss" independently of every other file. The old rate_pct /
 sent_within_7bd pair *did* use a per-file clock (confirmed deliberately
 on 2026-09-22 - see git history / prior docstring), but that per-file
 framing was the actual source of confusion, not a misunderstanding of
-it. Replaced with two metrics that don't make an individual pass/fail
-claim at all:
+it. Replaced with two metrics:
 
-  METRIC 1 - eligible_and_sent: a plain completion count. Of the files
-  that are ELIGIBLE (see below, unchanged), how many have simply been
-  marked Results Sent = Yes - no timing check on any individual file.
-  Shown against eligible_files as a completion rate.
+  METRIC 1 - eligible_and_sent: of the files that are ELIGIBLE (see
+  below, unchanged), how many were marked Results Sent = Yes by the SAME
+  cutoff used for eligibility (business day 7 of the processing month) -
+  one shared deadline for the whole cohort, not each file's own 7-day
+  clock from its own upload date (see CORRECTED 2026-10-27 note further
+  down for why this needed fixing after it first shipped). Shown against
+  eligible_files as a completion rate.
 
   METRIC 2 - avg_processing_days: the mean business-day gap between
-  Upload Date and Send Date, across eligible-and-sent files only.
-  Trend-only, descriptive - explicitly NOT a pass/fail test, and not
-  tied to any goal/target in this script. Confirmed with Pia: this will
-  get more precise once the new billing UI tracks "data became
-  available" directly rather than inferring it from Upload Date.
+  Upload Date and Send Date, across eligible files that were actually
+  sent (whether or not that send beat the cutoff - see CORRECTED
+  2026-10-27 note). Trend-only, descriptive - explicitly NOT a pass/fail
+  test, and not tied to any goal/target in this script. Confirmed with
+  Pia: this will get more precise once the new billing UI tracks "data
+  became available" directly rather than inferring it from Upload Date.
 
 rate_pct and sent_within_7bd (the old binary count and its percentage)
 are RETIRED going forward: this script no longer computes or writes
@@ -40,8 +43,41 @@ remain exactly as originally locked.
 
 total_files_sent is unchanged - still every row in the billing period
 with Results Sent = Yes, regardless of eligibility, and still refreshed
-forever (see point 5 further down) since this is explicitly meant to be
+forever (see point 6 further down) since this is explicitly meant to be
 trackable past the 7-day window, not an SLA-scoped number.
+
+--- CORRECTED 2026-10-27: eligible_and_sent had no timing check at all ---
+The Oct 7 redefinition above was supposed to replace the PER-FILE moving
+clock (each file judged against its own upload date + 7 business days)
+with a single, shared cutoff for the whole cohort - not remove timing
+from the metric entirely. As shipped, eligible_and_sent checked only
+"Results Sent = Yes," with no deadline of any kind, which is why
+completion rates came back near 100% across the board (a file sent on
+day 45 counted identically to one sent on day 2) - not a reflection of
+real throughput, and not what was asked for.
+
+Fixed: eligible_and_sent now additionally requires Send Date on or
+before the SAME cutoff already used for eligibility (business day 7 of
+the processing month - processing_deadline()). In other words: of
+everything that was available to send in the first 7 business days of
+the month, how much actually went out by then. See evaluate_row_sla()
+for the corrected logic.
+
+avg_processing_days is deliberately NOT restricted to this same cutoff -
+it's computed from every eligible row that was ever sent, whether or not
+it made the deadline, since it's meant to be a genuine average
+turnaround trend and quietly excluding the slow outliers would make it
+look better than reality. This means avg_processing_days and
+eligible_and_sent now draw from two overlapping but not identical row
+sets - worth knowing if the two numbers seem to disagree on a given
+month. (Flagging this as a judgment call, not a settled decision - happy
+to change it to match the stricter on-time set if that's preferred.)
+
+Every historical month computed under the no-timing-check version (i.e.
+anything run between 2026-10-07 and whenever this fix deploys) needs
+re-forcing through --month once this fix is deployed, or it will keep
+showing the inflated near-100% numbers forever (locked rows are never
+silently recomputed - see point 6 below).
 
 --- Design notes / assumptions (confirm these match reality before trusting numbers) ---
 1. "Eligible files" (confirmed with Pia 2026-09-22) = rows where Data
@@ -49,11 +85,16 @@ trackable past the 7-day window, not an SLA-scoped number.
    eligibility cutoff: business day 7 of the PROCESSING month (see
    processing_deadline()). A file that wasn't there by then can't be
    held to the metric. Unchanged by the Oct 2026 redefinition above.
-2. "eligible_and_sent" (Metric 1, see Oct 2026 note above) = eligible
-   rows where Results Sent is Yes. No timing component at all.
+2. "eligible_and_sent" (Metric 1, see Oct 2026 note above; corrected
+   2026-10-27) = eligible rows where Results Sent is Yes AND Send Date
+   is on or before the SAME cutoff used for eligibility (business day 7
+   of the processing month) - one shared deadline for the whole cohort,
+   not a per-file clock, and not timing-agnostic either.
 3. "avg_processing_days" (Metric 2, see Oct 2026 note above) = mean of
    business_days_elapsed(upload_date, send_date) across rows that are
-   both eligible and sent. Business days = Mon-Fri, EXCLUDING the 11
+   eligible and were actually sent, regardless of whether that send beat
+   the cutoff (deliberately a broader set than eligible_and_sent - see
+   CORRECTED 2026-10-27 note). Business days = Mon-Fri, EXCLUDING the 11
    standard US federal holidays (observed dates) AND Curacity's own
    closures (day after Thanksgiving, weekday Christmas Eve) - see
    federal_holidays(), curacity_closures() and business_days_elapsed().
@@ -64,7 +105,7 @@ trackable past the 7-day window, not an SLA-scoped number.
    whether the row was ever eligible. A deliberately different, ONGOING
    metric from eligible_and_sent - confirmed directly, not a bug: it
    keeps climbing all month as backlog clears, even after that billing
-   period's eligible_and_sent (point 5) has locked. See point 5 and
+   period's eligible_and_sent (point 6) has locked. See point 6 and
    patch_live_metrics() for how it stays live independently of the
    frozen eligibility-scoped fields.
 5. Column names have drifted across tabs over the years, so columns are
@@ -81,11 +122,7 @@ trackable past the 7-day window, not an SLA-scoped number.
    total_files_sent and avg_processing_days are the two exceptions: both
    keep being refreshed on every run via a narrow PATCH
    (patch_live_metrics()), forever, because both are intentionally
-   ongoing/descriptive rather than frozen reported outcomes. Note the
-   Oct 2026 redefinition changes WHY eligible_and_sent locking matters
-   (see that note) even though WHEN it locks is unchanged (same
-   sla_window_closed() timing as before - revisit if that no longer
-   makes sense now that there's no per-file clock backing it). To force
+   ongoing/descriptive rather than frozen reported outcomes. To force
    a full recompute of an already-locked month (overriding the freeze on
    all three fields, not just the live ones), pass its REPORTING label
    (e.g. '2026-08') as a CLI arg, or delete its row from the Supabase
@@ -184,8 +221,8 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]  # raw J
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 TRAILING_MONTHS = 24  # how far back to backfill/consider for the trend line
-BUSINESS_DAY_SLA = 7  # still used for the eligibility cutoff and lock timing -
-                      # no longer used as a per-file pass/fail threshold
+BUSINESS_DAY_SLA = 7  # used for the eligibility cutoff, the eligible_and_sent
+                      # cutoff, and lock timing - no longer a per-file clock
 MONTH_OFFSET = 1  # the actively-worked tab is always the PREVIOUS calendar
                   # month, not the current one - confirmed with the team.
                   # e.g. in late July, the live/active tab is still June's.
@@ -427,9 +464,9 @@ def business_days_elapsed(start_date, end_date):
     out of order.
 
     Used for: (a) processing_deadline()/sla_window_closed()'s cutoff and
-    lock-timing math, and (b) per-row elapsed time feeding
-    avg_processing_days (Metric 2) - purely descriptive there now, not a
-    pass/fail test."""
+    lock-timing math, (b) the eligible_and_sent cutoff comparison, and
+    (c) per-row elapsed time feeding avg_processing_days (Metric 2) -
+    purely descriptive there, not a pass/fail test."""
     if start_date is None or end_date is None:
         return None
     if end_date < start_date:
@@ -460,11 +497,18 @@ def nth_business_day(year, month, n):
 
 
 def processing_deadline(billing_period):
-    """The ELIGIBILITY deadline for a billing period: business day
+    """The shared cutoff for a billing period: business day
     BUSINESS_DAY_SLA of the PROCESSING month (the month after the billing
     period - July's billing period is processed in August). e.g.
-    '2026-07' -> Tue 2026-08-11. Unchanged by the Oct 2026 metric
-    redefinition - this still gates what counts as "eligible" at all."""
+    '2026-07' -> Tue 2026-08-11.
+
+    This single date now gates TWO things, both deliberately using the
+    exact same cutoff rather than separate ones: (1) eligibility - a file
+    not uploaded by this date was never eligible at all, and (2) the
+    eligible_and_sent timing check (see CORRECTED 2026-10-27 note) - a
+    file must also have been SENT by this same date to count toward
+    eligible_and_sent. One shared deadline for the whole cohort, not a
+    per-file clock."""
     year, month = (int(x) for x in shift_month_key(billing_period, 1).split("-"))
     return nth_business_day(year, month, BUSINESS_DAY_SLA)
 
@@ -486,26 +530,48 @@ def evaluate_row_sla(billing_period, uploaded_flag, upload_date, sent_flag, send
     computed for a single row, shared by the real sync and --list-rows
     so they can never disagree.
 
-    REDEFINED 2026-10-07 (see module docstring's "REDEFINED" section):
-      eligible          = Data Uploaded = Yes AND Upload Date on or
-                           before the eligibility cutoff (business day 7
-                           of the processing month). Unchanged.
-      eligible_and_sent = eligible AND Results Sent = Yes. NO timing
-                           check - this is Metric 1's per-row unit.
-      elapsed           = business days from Upload Date to Send Date,
-                           computed ONLY when eligible_and_sent is true.
-                           Feeds Metric 2 (avg_processing_days) as a
-                           trend input, never as a pass/fail gate.
+    CORRECTED 2026-10-27 (see module docstring's "CORRECTED" section):
+    the Oct 7 redefinition went further than intended and dropped the
+    timing check entirely. The actual ask was to replace the PER-FILE
+    moving clock (each file judged against its own upload date + 7
+    business days) with a single, shared cutoff applied to every file in
+    the cohort - the SAME cutoff already used for eligibility (business
+    day 7 of the processing month). It was never meant to become "sent,
+    whenever that happened."
+
+      eligible              = Data Uploaded = Yes AND Upload Date on or
+                               before the eligibility cutoff. Unchanged.
+      eligible_and_sent     = eligible AND Results Sent = Yes AND Send
+                               Date on or before that SAME cutoff (not
+                               the file's own upload date + 7 - one
+                               shared deadline for every eligible file
+                               in the period, matching "how much of
+                               what was available in the first 7
+                               business days did we actually get out by
+                               then"). This is Metric 1's per-row unit,
+                               and is the numerator behind the
+                               dashboard's "Eligible & Sent" /
+                               "Completion Rate" cards.
+      elapsed                = business days from Upload Date to Send
+                               Date, computed for ANY row that is
+                               eligible and was actually sent -
+                               WHETHER OR NOT it made the cutoff. This
+                               deliberately is NOT restricted to
+                               eligible_and_sent: avg_processing_days is
+                               a descriptive turnaround-time trend, and
+                               silently excluding the slow/late files
+                               from it would make average processing
+                               time look better than it actually is.
 
     Returns (eligible, eligible_and_sent, cutoff, elapsed_business_days).
-    elapsed is None whenever eligible_and_sent is False (nothing to
-    measure yet), or when send_date is missing/unparseable despite the
-    sent flag being set."""
+    elapsed is None only when the file was never actually sent, or when
+    send_date is missing/unparseable despite the sent flag being set."""
     cutoff = processing_deadline(billing_period)
     eligible = bool(uploaded_flag and upload_date is not None and upload_date <= cutoff)
-    eligible_and_sent = bool(eligible and sent_flag)
+    eligible_and_ever_sent = bool(eligible and sent_flag)
+    eligible_and_sent = bool(eligible_and_ever_sent and send_date is not None and send_date <= cutoff)
     elapsed = None
-    if eligible_and_sent and upload_date and send_date:
+    if eligible_and_ever_sent and upload_date and send_date:
         elapsed = business_days_elapsed(upload_date, send_date)
     return eligible, eligible_and_sent, cutoff, elapsed
 
@@ -515,15 +581,10 @@ def sla_window_closed(billing_period, today=None):
     billing period is treated as final and ready to lock: the day after
     (eligibility cutoff + BUSINESS_DAY_SLA business days).
 
-    NOTE (Oct 2026): this timing is UNCHANGED from before the metric
-    redefinition, but its justification has changed. It used to mark the
-    point at which every individual file's personal 7-day pass/fail
-    clock had necessarily expired. Now that eligible_and_sent has no
-    per-file clock, this date instead marks "a reasonable grace period
-    past the eligibility cutoff, after which we freeze the reported
-    completion count for this period" - a policy choice carried forward
-    unchanged rather than re-derived. Revisit this window length if it
-    no longer reflects actual processing turnaround."""
+    This grace period is unchanged by the 2026-10-27 correction - it was
+    already a deliberate buffer past the cutoff itself, not something
+    tied to the old per-file clock. Revisit this window length if it no
+    longer reflects actual processing turnaround."""
     if today is None:
         today = dt.date.today()
     last_possible_grace_date = add_business_days(processing_deadline(billing_period), BUSINESS_DAY_SLA)
@@ -537,8 +598,10 @@ class MonthAgg:
     total_files_sent: int = 0
     rows_seen: int = 0
     elapsed_days: list = field(default_factory=list)  # business days elapsed,
-                                                        # eligible-and-sent rows
-                                                        # only - feeds the
+                                                        # across eligible rows
+                                                        # that were actually
+                                                        # sent (on time or not)
+                                                        # - feeds the
                                                         # avg_processing_days
                                                         # trend metric
 
@@ -667,8 +730,8 @@ def extract_month_aggregates(spreadsheet, billing_periods_wanted):
                 agg.eligible_files += 1
             if eligible_and_sent:
                 agg.eligible_and_sent += 1
-                if elapsed is not None:
-                    agg.elapsed_days.append(elapsed)
+            if elapsed is not None:
+                agg.elapsed_days.append(elapsed)
 
             if sent_flag:
                 agg.total_files_sent += 1
@@ -802,9 +865,11 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
 
     found = 0
     inferred_total = 0
-    not_yet_sent = []  # eligible rows with Results Sent not Yes - replaces the
-                        # old "missed by reason" breakdown, which no longer
-                        # applies since there's no timing-based miss condition
+    not_yet_sent = []  # eligible rows with Results Sent not Yes at all
+    sent_late = []      # eligible rows that WERE sent, but after the cutoff -
+                        # these count toward total_files_sent and toward
+                        # avg_processing_days, but NOT toward eligible_and_sent
+                        # (see CORRECTED 2026-10-27 note)
     unparsed_by_tab = {}            # tab title -> [(hotel, raw period)]
     unrecognized_sent_values = {}   # raw Results Sent value -> row count
     elapsed_days_found = []
@@ -865,8 +930,10 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
             )
 
             if eligible and not eligible_and_sent:
-                raw_send = _cell(row, col_send_date).strip()
-                not_yet_sent.append(f"{hotel} (upload {upload_date})")
+                if sent_flag and send_date is not None:
+                    sent_late.append(f"{hotel} (upload {upload_date}, sent {send_date}, cutoff {deadline})")
+                else:
+                    not_yet_sent.append(f"{hotel} (upload {upload_date})")
 
             if elapsed is not None:
                 elapsed_days_found.append(elapsed)
@@ -886,13 +953,17 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
     print(f"\n{found} row(s) found for billing period {billing_period} "
           f"({inferred_total} of them via tab-title fallback for a blank period cell).")
 
-    print(f"\nELIGIBLE BUT NOT YET SENT - {len(not_yet_sent)} row(s) "
-          f"(no timing judgment here - just not marked Results Sent = Yes yet):")
+    print(f"\nELIGIBLE, NOT SENT AT ALL - {len(not_yet_sent)} row(s):")
     for h in not_yet_sent:
         print(f"    {h}")
 
+    print(f"\nELIGIBLE, SENT LATE (after the cutoff - counts toward total_files_sent "
+          f"and avg_processing_days, but NOT toward eligible_and_sent) - {len(sent_late)} row(s):")
+    for h in sent_late:
+        print(f"    {h}")
+
     avg = _avg(elapsed_days_found)
-    print(f"\nAVG PROCESSING DAYS (eligible-and-sent rows only): "
+    print(f"\nAVG PROCESSING DAYS (eligible rows that were actually sent, on time or late): "
           f"{avg if avg is not None else 'n/a'} across {len(elapsed_days_found)} row(s)")
 
     if unparsed_by_tab:
