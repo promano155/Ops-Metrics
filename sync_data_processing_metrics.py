@@ -83,12 +83,36 @@ re-forcing through --month once this fix is deployed, or it will keep
 showing the inflated near-100% numbers forever (locked rows are never
 silently recomputed - see point 6 below).
 
+--- ADDED 2026-10-27: a file flagged to Innova is never eligible ---
+Confirmed with Pia, after cross-checking the August 2026 billing period
+directly: 75 of 451 files that looked eligible by date were ALSO marked
+Flag to Innova = Yes. A file that needed to be flagged to Innova was
+never on a normal processing track to begin with - holding it to the
+7-day eligibility window (and therefore to eligible_and_sent/completion
+rate) misrepresents what actually happened with it.
+
+Fixed: eligibility now requires Flag to Innova to NOT be Yes, checked
+BEFORE the date-based test - a flagged row is excluded even if it also
+has a valid, in-window Upload Date. See evaluate_row_sla(). If a tab has
+no Flag to Innova column at all, this has no effect (defaults to "not
+flagged," same as before).
+
+This changes eligible_files (the denominator) as well as
+eligible_and_sent (the numerator) - both drop when a flagged row is
+excluded, so the completion RATE moves less than either raw count does
+on its own. Every historical month computed before this fix needs
+re-forcing through --month once deployed, same as the eligible_and_sent
+timing fix above.
+
 --- Design notes / assumptions (confirm these match reality before trusting numbers) ---
-1. "Eligible files" (confirmed with Pia 2026-09-22) = rows where Data
-   Uploaded is Yes/TRUE AND the Upload Date is on or before the
-   eligibility cutoff: business day 7 of the PROCESSING month (see
-   processing_deadline()). A file that wasn't there by then can't be
-   held to the metric. Unchanged by the Oct 2026 redefinition above.
+1. "Eligible files" (confirmed with Pia 2026-09-22; Flag-to-Innova
+   exclusion added 2026-10-27) = rows where Flag to Innova is NOT Yes,
+   AND Data Uploaded is Yes/TRUE, AND the Upload Date is on or before
+   the eligibility cutoff: business day 7 of the PROCESSING month (see
+   processing_deadline()). A file flagged to Innova was never on a
+   normal processing track and is excluded regardless of its dates. A
+   file that wasn't uploaded by the cutoff can't be held to the metric
+   either. Unchanged otherwise by the Oct 2026 redefinition above.
 2. "eligible_and_sent" (Metric 1, see Oct 2026 note above; corrected
    2026-10-27) = eligible rows where Results Sent is Yes AND Send Date
    is on or before the SAME cutoff used for eligibility (business day 7
@@ -244,6 +268,7 @@ COLUMN_ALIASES = {
         "Invoice Sent",
     ],
     "send_date": ["Send Date", "Invoice Send Date"],
+    "flag_to_innova": ["Flag to Innova"],
 }
 
 TRUE_VALUES = {"yes", "true", "y"}
@@ -529,7 +554,7 @@ def add_business_days(start_date, n):
     return current
 
 
-def evaluate_row_sla(billing_period, uploaded_flag, upload_date, sent_flag, send_date):
+def evaluate_row_sla(billing_period, uploaded_flag, upload_date, sent_flag, send_date, flagged_to_innova=False):
     """The ONE place eligibility and the two throughput metrics are
     computed for a single row, shared by the real sync and --list-rows
     so they can never disagree.
@@ -543,8 +568,21 @@ def evaluate_row_sla(billing_period, uploaded_flag, upload_date, sent_flag, send
     day 7 of the processing month). It was never meant to become "sent,
     whenever that happened."
 
-      eligible              = Data Uploaded = Yes AND Upload Date on or
-                               before the eligibility cutoff. Unchanged.
+    ADDED 2026-10-27: a row flagged to Innova (Flag to Innova = Yes) is
+    NEVER eligible, regardless of its Upload Date or the Data Uploaded
+    flag. Confirmed with Pia: a file that needed to be flagged to Innova
+    was never on a normal processing track to begin with, so holding it
+    to the eligibility window (and therefore to eligible_and_sent /
+    completion rate) misrepresents what actually happened with it. This
+    is checked BEFORE the date-based eligibility test - a flagged row is
+    excluded even if it also happens to have a valid, in-window upload
+    date. If the sheet has no Flag to Innova column at all (some tabs
+    don't), flagged_to_innova defaults to False and eligibility falls
+    back to exactly the date-based test, unaffected.
+
+      eligible              = NOT flagged to Innova, AND Data Uploaded =
+                               Yes, AND Upload Date on or before the
+                               eligibility cutoff.
       eligible_and_sent     = eligible AND Results Sent = Yes AND Send
                                Date on or before that SAME cutoff (not
                                the file's own upload date + 7 - one
@@ -559,11 +597,11 @@ def evaluate_row_sla(billing_period, uploaded_flag, upload_date, sent_flag, send
       elapsed                = business days from Upload Date to Send
                                Date, computed for ANY row that was
                                actually sent and has both dates present -
-                               ELIGIBILITY PLAYS NO PART in this at all
-                               (confirmed with Pia 2026-10-27: this
-                               should be across everything, not scoped
-                               to the 7-day eligibility window). A file
-                               uploaded well after the eligibility cutoff
+                               ELIGIBILITY (Innova-flagged or otherwise)
+                               PLAYS NO PART in this at all (confirmed
+                               with Pia 2026-10-27: this should be across
+                               everything, not scoped to the eligibility
+                               window). A flagged or late-uploaded file
                                still contributes its turnaround time
                                here, even though it's excluded from
                                eligible_files/eligible_and_sent entirely.
@@ -573,7 +611,12 @@ def evaluate_row_sla(billing_period, uploaded_flag, upload_date, sent_flag, send
     upload_date/send_date are missing/unparseable despite the sent flag
     being set."""
     cutoff = processing_deadline(billing_period)
-    eligible = bool(uploaded_flag and upload_date is not None and upload_date <= cutoff)
+    eligible = bool(
+        not flagged_to_innova
+        and uploaded_flag
+        and upload_date is not None
+        and upload_date <= cutoff
+    )
     eligible_and_sent = bool(eligible and sent_flag and send_date is not None and send_date <= cutoff)
     elapsed = None
     if sent_flag and upload_date and send_date:
@@ -689,6 +732,8 @@ def extract_month_aggregates(spreadsheet, billing_periods_wanted):
         col_upload_date = find_col_index(headers, "upload_date")
         col_sent_flag = find_col_index(headers, "results_sent_flag")
         col_send_date = find_col_index(headers, "send_date")
+        col_flag_innova = find_col_index(headers, "flag_to_innova")  # optional - not every
+                                                                      # tab has this column
 
         # A tab needs a Billing Period column to contribute anything -
         # everything is grouped off of it. Reference tabs (contact
@@ -727,9 +772,10 @@ def extract_month_aggregates(spreadsheet, billing_periods_wanted):
             upload_date = parse_date(_cell(row, col_upload_date), year, ref_month)
             sent_flag = is_truthy(_cell(row, col_sent_flag)) if col_sent_flag is not None else bool(_cell(row, col_send_date))
             send_date = parse_date(_cell(row, col_send_date), year, ref_month)
+            flagged_to_innova = is_truthy(_cell(row, col_flag_innova)) if col_flag_innova is not None else False
 
             eligible, eligible_and_sent, _cutoff, elapsed = evaluate_row_sla(
-                billing_month_key, uploaded_flag, upload_date, sent_flag, send_date
+                billing_month_key, uploaded_flag, upload_date, sent_flag, send_date, flagged_to_innova
             )
             if eligible:
                 agg.eligible_files += 1
@@ -875,6 +921,9 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
                         # these count toward total_files_sent and toward
                         # avg_processing_days, but NOT toward eligible_and_sent
                         # (see CORRECTED 2026-10-27 note)
+    excluded_innova_flagged = []  # rows that would otherwise have been eligible
+                                   # by date, but are excluded because they're
+                                   # flagged to Innova (see ADDED 2026-10-27 note)
     unparsed_by_tab = {}            # tab title -> [(hotel, raw period)]
     unrecognized_sent_values = {}   # raw Results Sent value -> row count
     elapsed_days_found = []
@@ -896,6 +945,7 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
         col_upload_date = find_col_index(headers, "upload_date")
         col_sent_flag = find_col_index(headers, "results_sent_flag")
         col_send_date = find_col_index(headers, "send_date")
+        col_flag_innova = find_col_index(headers, "flag_to_innova")
 
         col_hotel = find_hotel_col_index(headers)
 
@@ -925,14 +975,24 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
             upload_date = parse_date(_cell(row, col_upload_date), year, ref_month)
             sent_flag = is_truthy(_cell(row, col_sent_flag)) if col_sent_flag is not None else bool(_cell(row, col_send_date))
             send_date = parse_date(_cell(row, col_send_date), year, ref_month)
+            flagged_to_innova = is_truthy(_cell(row, col_flag_innova)) if col_flag_innova is not None else False
 
             raw_sent = _cell(row, col_sent_flag) if col_sent_flag is not None else ""
             if raw_sent.strip() and not sent_flag and normalize(raw_sent) not in {"no", "n", "false"}:
                 unrecognized_sent_values[raw_sent.strip()] = unrecognized_sent_values.get(raw_sent.strip(), 0) + 1
 
             eligible, eligible_and_sent, deadline, elapsed = evaluate_row_sla(
-                parsed_period[0], uploaded_flag, upload_date, sent_flag, send_date
+                parsed_period[0], uploaded_flag, upload_date, sent_flag, send_date, flagged_to_innova
             )
+
+            # Would this row have been eligible on dates alone, if not for
+            # the Innova flag? Purely for the diagnostic bucket below -
+            # doesn't affect eligible/eligible_and_sent themselves.
+            would_be_eligible_by_date = bool(
+                uploaded_flag and upload_date is not None and upload_date <= deadline
+            )
+            if flagged_to_innova and would_be_eligible_by_date:
+                excluded_innova_flagged.append(f"{hotel} (upload {upload_date})")
 
             if eligible and not eligible_and_sent:
                 if sent_flag and send_date is not None:
@@ -945,7 +1005,7 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
 
             print(
                 f"[{ws.title}] {hotel} | uploaded={uploaded_flag} upload_date={upload_date} | "
-                f"sent={sent_flag} send_date={send_date} | "
+                f"sent={sent_flag} send_date={send_date} | flagged_to_innova={flagged_to_innova} | "
                 f"elapsed_business_days={elapsed} | eligibility_cutoff={deadline} | "
                 f"eligible={eligible} eligible_and_sent={eligible_and_sent} "
                 f"| contributes_to_total_files_sent={sent_flag}"
@@ -965,6 +1025,12 @@ def list_rows_for_billing_period(spreadsheet, billing_period):
     print(f"\nELIGIBLE, SENT LATE (after the cutoff - counts toward total_files_sent "
           f"and avg_processing_days, but NOT toward eligible_and_sent) - {len(sent_late)} row(s):")
     for h in sent_late:
+        print(f"    {h}")
+
+    print(f"\nEXCLUDED - FLAGGED TO INNOVA (would otherwise have been eligible by date, "
+          f"but Flag to Innova = Yes means they never were on a normal processing track - "
+          f"see ADDED 2026-10-27 note) - {len(excluded_innova_flagged)} row(s):")
+    for h in excluded_innova_flagged:
         print(f"    {h}")
 
     avg = _avg(elapsed_days_found)
